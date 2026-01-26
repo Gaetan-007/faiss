@@ -11,6 +11,7 @@
 import numpy as np
 
 from faiss.loader import *
+from faiss.array_conversions import vector_to_array
 
 
 ###########################################
@@ -52,6 +53,163 @@ def index_cpu_to_gpus_list(index, co=None, gpus=None, ngpu=-1):
     res = [StandardGpuResources() for _ in gpus]
     index_gpu = index_cpu_to_gpu_multiple_py(res, index, co, gpus)
     return index_gpu
+
+# NOTE: (wangzehao) This function is used to convert a list of list IDs to a Int64Vector
+def _to_int64_vector(list_ids):
+    v = Int64Vector()
+    if np.isscalar(list_ids):
+        v.push_back(int(list_ids))
+        return v
+    for val in np.asarray(list_ids, dtype=np.int64).ravel():
+        v.push_back(int(val))
+    return v
+
+# NOTE: (wangzehao) This function is used to convert a UInt64Vector to a numpy array using efficient memory copy
+def _uint64_vector_to_numpy(vec):
+    """Convert UInt64Vector to numpy array using efficient memory copy."""
+    return vector_to_array(vec)
+
+# NOTE: (wangzehao) This function is used to evict a single IVF list (centroid) to CPU memory and free GPU memory
+def evict_ivf_lists(index, list_ids):
+    """Evict IVF lists (centroids) to CPU memory and return reclaimed bytes."""
+    if np.isscalar(list_ids):
+        return index.evictCentroidToCpu(int(list_ids))
+    v = _to_int64_vector(list_ids)
+    out = index.evictCentroidsToCpu(v)
+    return _uint64_vector_to_numpy(out)
+
+# NOTE: (wangzehao) This function is used to load a single IVF list (centroid) from CPU memory back to GPU
+def load_ivf_lists(index, list_ids):
+    """Load IVF lists (centroids) back to GPU and return loaded bytes."""
+    if np.isscalar(list_ids):
+        return index.loadCentroidToGpu(int(list_ids))
+    v = _to_int64_vector(list_ids)
+    out = index.loadCentroidsToGpu(v)
+    return _uint64_vector_to_numpy(out)
+
+
+###########################################
+# Page-fault style auto-fetch management
+# NOTE: (wangzehao) Below functions implement automatic load-on-demand
+###########################################
+
+def set_auto_fetch(index, enable):
+    """
+    Enable or disable automatic fetching of evicted lists during search.
+    
+    When enabled, search operations will automatically load any IVF lists
+    that are needed but currently evicted (in CPU cache) - similar to
+    a page fault handler.
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+    enable : bool
+        True to enable auto-fetch, False to disable
+    """
+    index.setAutoFetch(enable)
+
+
+def is_auto_fetch_enabled(index):
+    """
+    Check if auto-fetch is currently enabled.
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+        
+    Returns
+    -------
+    bool
+        True if auto-fetch is enabled
+    """
+    return index.isAutoFetchEnabled()
+
+
+def is_list_on_gpu(index, list_id):
+    """
+    Check if a single IVF list (centroid) is currently on GPU.
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+    list_id : int
+        The list ID to check
+        
+    Returns
+    -------
+    bool
+        True if the list data is on GPU, False if evicted
+    """
+    return index.isListOnGpu(int(list_id))
+
+
+def get_evicted_lists(index):
+    """
+    Get the set of lists that are currently evicted (in CPU cache).
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+        
+    Returns
+    -------
+    numpy.ndarray
+        Array of list IDs that are currently evicted
+    """
+    vec = index.getEvictedLists()
+    return vector_to_array(vec)
+
+
+def get_auto_fetch_stats(index):
+    """
+    Get statistics about auto-fetch operations (for debugging/profiling).
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+        
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'total_fetches': Total number of auto-fetch operations triggered
+        - 'total_lists_fetched': Total number of lists fetched
+        - 'total_bytes_fetched': Total bytes fetched from CPU
+    """
+    try:
+        stats_vec = GpuIndexIVFFlat_getAutoFetchStatsVector(index)
+    except NameError as exc:
+        raise RuntimeError(
+            "GpuIndexIVFFlat_getAutoFetchStatsVector is not available; "
+            "rebuild Python bindings with GPU support"
+        ) from exc
+    if stats_vec.size() != 3:
+        raise RuntimeError(
+            f"Unexpected auto-fetch stats length: {stats_vec.size()}")
+    return {
+        'total_fetches': int(stats_vec.at(0)),
+        'total_lists_fetched': int(stats_vec.at(1)),
+        'total_bytes_fetched': int(stats_vec.at(2)),
+    }
+
+
+def reset_auto_fetch_stats(index):
+    """
+    Reset auto-fetch statistics.
+    
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+    """
+    index.resetAutoFetchStats()
+
 
 # allows numpy ndarray usage with bfKnn
 

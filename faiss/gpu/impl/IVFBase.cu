@@ -142,6 +142,70 @@ void IVFBase::reset() {
     maxListLength_ = 0;
 }
 
+/// NOTE: (wangzehao) This function is used to evict a single IVF list from GPU memory and return reclaimed bytes
+size_t IVFBase::evictList(idx_t listId) {
+    FAISS_THROW_IF_NOT_FMT(
+            listId < numLists_,
+            "IVF list %ld is out of bounds (%ld lists total)",
+            listId,
+            numLists_);
+
+    auto stream = resources_->getDefaultStreamCurrentDevice();
+
+    auto& listData = deviceListData_[listId];
+    auto& listIndices = deviceListIndices_[listId];
+
+    size_t reclaimed = listData->data.capacity() + listIndices->data.capacity();
+
+    listData->data.clear();
+    listIndices->data.clear();
+    listData->numVecs = 0;
+    listIndices->numVecs = 0;
+
+    if (indicesOptions_ == INDICES_CPU) {
+        FAISS_ASSERT(listId < listOffsetToUserIndex_.size());
+        listOffsetToUserIndex_[listId].clear();
+    }
+
+    // Update device-side info for this list
+    updateDeviceListInfo_({listId}, stream);
+
+    return reclaimed;
+}
+
+/// NOTE: (wangzehao) This function is used to check if a single IVF list is on GPU (for page-fault style management)
+bool IVFBase::isListOnGpu(idx_t listId) const {
+    FAISS_THROW_IF_NOT_FMT(
+            listId < numLists_,
+            "IVF list %ld is out of bounds (%ld lists total)",
+            listId,
+            numLists_);
+
+    // A list is considered "on GPU" if it has data allocated
+    // An evicted list will have numVecs = 0 and empty data
+    return deviceListData_[listId]->numVecs > 0 ||
+           deviceListData_[listId]->data.size() > 0;
+}
+
+/// NOTE: (wangzehao) This function is used to find missing lists for auto-fetch
+std::vector<idx_t> IVFBase::findMissingLists(
+        const std::vector<idx_t>& listIds) const {
+    std::vector<idx_t> missing;
+    missing.reserve(listIds.size());
+
+    for (auto listId : listIds) {
+        if (listId < 0 || listId >= numLists_) {
+            // Invalid list ID, skip
+            continue;
+        }
+        if (!isListOnGpu(listId)) {
+            missing.push_back(listId);
+        }
+    }
+
+    return missing;
+}
+
 idx_t IVFBase::getDim() const {
     return dim_;
 }
@@ -340,6 +404,15 @@ void IVFBase::copyInvertedListsTo(InvertedLists* ivf) {
         ivf->add_entries(
                 i, listIndices.size(), listIndices.data(), listData.data());
     }
+}
+
+/// NOTE: (wangzehao) This function is used to add a single list from CPU-encoded data into an empty GPU list
+void IVFBase::addEncodedVectorsToListFromCpu(
+        idx_t listId,
+        const void* codes,
+        const idx_t* indices,
+        idx_t numVecs) {
+    addEncodedVectorsToList_(listId, codes, indices, numVecs);
 }
 
 void IVFBase::reconstruct_n(idx_t i0, idx_t n, float* out) {

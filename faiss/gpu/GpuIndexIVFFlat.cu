@@ -21,7 +21,13 @@
 #include <faiss/gpu/impl/CuvsIVFFlat.cuh>
 #endif
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <limits>
+#include <stdexcept>
+#include <unordered_set>
 
 namespace faiss {
 namespace gpu {
@@ -200,6 +206,288 @@ void GpuIndexIVFFlat::updateQuantizer() {
     if (index_) {
         index_->updateQuantizer(quantizer);
     }
+}
+
+/// NOTE: (wangzehao) This function is used to evict a single IVF list (centroid) to CPU memory and free GPU memory
+size_t GpuIndexIVFFlat::evictCentroidToCpu(idx_t listId) {
+    DeviceScope scope(config_.device);
+
+    FAISS_THROW_IF_NOT_MSG(index_, "IVF index not initialized");
+    FAISS_THROW_IF_NOT_FMT(
+            listId < nlist,
+            "IVF list %ld is out of bounds (%ld lists total)",
+            listId,
+            nlist);
+
+    if (cpuListCache_.count(listId)) {
+        return 0;
+    }
+
+    CpuListCache cache;
+    cache.codes = index_->getListVectorData(listId, false);
+    cache.ids = index_->getListIndices(listId);
+
+    cpuListCache_.emplace(listId, std::move(cache));
+
+    return index_->evictList(listId);
+}
+
+/// NOTE: (wangzehao) This function is used to load a single IVF list (centroid) from CPU memory back to GPU
+size_t GpuIndexIVFFlat::loadCentroidToGpu(idx_t listId) {
+    DeviceScope scope(config_.device);
+
+    FAISS_THROW_IF_NOT_MSG(index_, "IVF index not initialized");
+    FAISS_THROW_IF_NOT_FMT(
+            listId < nlist,
+            "IVF list %ld is out of bounds (%ld lists total)",
+            listId,
+            nlist);
+
+    auto it = cpuListCache_.find(listId);
+    if (it == cpuListCache_.end()) {
+        return 0;
+    }
+
+    auto& cache = it->second;
+    auto numVecs = (idx_t)cache.ids.size();
+
+    if (ivfFlatConfig_.indicesOptions != INDICES_IVF) {
+        FAISS_THROW_IF_NOT_MSG(
+                !cache.ids.empty(),
+                "Cached IVF list is missing indices for GPU load");
+    }
+
+    index_->addEncodedVectorsToListFromCpu(
+            listId,
+            cache.codes.data(),
+            cache.ids.empty() ? nullptr : cache.ids.data(),
+            numVecs);
+
+    size_t bytesLoaded = cache.codes.size() + cache.ids.size() * sizeof(idx_t);
+    cpuListCache_.erase(it);
+
+    return bytesLoaded;
+}
+
+/// NOTE: (wangzehao) This function is used to evict multiple IVF lists (centroids) to CPU memory and free GPU memory
+std::vector<uint64_t> GpuIndexIVFFlat::evictCentroidsToCpu(
+        const std::vector<idx_t>& listIds) {
+    std::vector<uint64_t> out;
+    out.reserve(listIds.size());
+
+    for (auto listId : listIds) {
+        out.push_back(static_cast<uint64_t>(evictCentroidToCpu(listId)));
+    }
+
+    return out;
+}
+
+/// NOTE: (wangzehao) This function is used to load multiple IVF lists (centroids) from CPU memory back to GPU
+std::vector<uint64_t> GpuIndexIVFFlat::loadCentroidsToGpu(
+        const std::vector<idx_t>& listIds) {
+    std::vector<uint64_t> out;
+    out.reserve(listIds.size());
+
+    for (auto listId : listIds) {
+        out.push_back(static_cast<uint64_t>(loadCentroidToGpu(listId)));
+    }
+
+    return out;
+}
+
+/// NOTE: (wangzehao) This function is used to process a shared-memory IPC command; returns true if one was handled
+bool GpuIndexIVFFlat::processSharedMemoryCommand(const char* shmName) {
+    FAISS_THROW_IF_NOT_MSG(shmName, "shmName must not be null");
+
+    int fd = shm_open(shmName, O_RDWR, 0666);
+    if (fd < 0) {
+        return false;
+    }
+
+    auto* cmd = static_cast<IpcCommand*>(mmap(
+            nullptr,
+            sizeof(IpcCommand),
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0));
+    close(fd);
+
+    if (cmd == MAP_FAILED) {
+        return false;
+    }
+
+    bool handled = false;
+
+    if (cmd->magic == kIpcMagic && cmd->version == kIpcVersion &&
+        cmd->state.load(std::memory_order_acquire) == kIpcStatePending) {
+        handled = true;
+        cmd->result.store(0, std::memory_order_release);
+
+        try {
+            auto op = cmd->opcode.load(std::memory_order_acquire);
+            auto listId = static_cast<idx_t>(
+                    cmd->listId.load(std::memory_order_acquire));
+
+            size_t result = 0;
+            if (op == kIpcOpEvict) {
+                result = evictCentroidToCpu(listId);
+                cmd->state.store(kIpcStateDone, std::memory_order_release);
+            } else if (op == kIpcOpLoad) {
+                result = loadCentroidToGpu(listId);
+                cmd->state.store(kIpcStateDone, std::memory_order_release);
+            } else {
+                cmd->state.store(kIpcStateError, std::memory_order_release);
+                cmd->result.store(-1, std::memory_order_release);
+            }
+
+            if (op == kIpcOpEvict || op == kIpcOpLoad) {
+                cmd->result.store(
+                        static_cast<int64_t>(result),
+                        std::memory_order_release);
+            }
+        } catch (const std::exception&) {
+            cmd->state.store(kIpcStateError, std::memory_order_release);
+            cmd->result.store(-1, std::memory_order_release);
+        }
+    }
+
+    munmap(cmd, sizeof(IpcCommand));
+    return handled;
+}
+
+//
+// Page-fault style auto-fetch implementation
+// NOTE: (wangzehao) Below functions implement automatic load-on-demand
+//
+
+void GpuIndexIVFFlat::setAutoFetch(bool enable) {
+    autoFetchEnabled_ = enable;
+}
+
+bool GpuIndexIVFFlat::isAutoFetchEnabled() const {
+    return autoFetchEnabled_;
+}
+
+bool GpuIndexIVFFlat::isListOnGpu(idx_t listId) const {
+    DeviceScope scope(config_.device);
+
+    FAISS_THROW_IF_NOT_MSG(index_, "IVF index not initialized");
+    FAISS_THROW_IF_NOT_FMT(
+            listId < nlist,
+            "IVF list %ld is out of bounds (%ld lists total)",
+            listId,
+            nlist);
+
+    return index_->isListOnGpu(listId);
+}
+
+std::vector<idx_t> GpuIndexIVFFlat::getEvictedLists() const {
+    DeviceScope scope(config_.device);
+
+    std::vector<idx_t> evicted;
+    evicted.reserve(cpuListCache_.size());
+
+    for (const auto& kv : cpuListCache_) {
+        evicted.push_back(kv.first);
+    }
+
+    return evicted;
+}
+
+GpuIndexIVFFlat::AutoFetchStats GpuIndexIVFFlat::getAutoFetchStats() const {
+    return autoFetchStats_;
+}
+
+void GpuIndexIVFFlat::resetAutoFetchStats() {
+    autoFetchStats_ = {0, 0, 0};
+}
+
+size_t GpuIndexIVFFlat::fetchMissingListsForSearch_(
+        const std::vector<idx_t>& listIds) {
+    if (!autoFetchEnabled_) {
+        return 0;
+    }
+
+    // Find which lists are in the CPU cache (i.e., evicted from GPU)
+    std::vector<idx_t> toFetch;
+    toFetch.reserve(listIds.size());
+
+    for (auto listId : listIds) {
+        if (listId < 0 || listId >= nlist) {
+            continue;
+        }
+        // Check if this list is in CPU cache (meaning it was evicted)
+        if (cpuListCache_.count(listId) > 0) {
+            toFetch.push_back(listId);
+        }
+    }
+
+    if (toFetch.empty()) {
+        return 0;
+    }
+
+    // Load missing lists from CPU cache to GPU
+    size_t totalBytes = 0;
+    for (auto listId : toFetch) {
+        size_t bytes = loadCentroidToGpu(listId);
+        totalBytes += bytes;
+    }
+
+    // Update statistics
+    autoFetchStats_.totalFetches++;
+    autoFetchStats_.totalListsFetched += toFetch.size();
+    autoFetchStats_.totalBytesFetched += totalBytes;
+
+    return toFetch.size();
+}
+
+void GpuIndexIVFFlat::searchImpl_(
+        idx_t n,
+        const float* x,
+        int k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    // Device should already be set by GpuIndex::search
+    DeviceScope scope(config_.device);
+
+    // If auto-fetch is not enabled, just call parent implementation
+    if (!autoFetchEnabled_ || cpuListCache_.empty()) {
+        GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+        return;
+    }
+
+    // We need to determine which IVF lists will be accessed
+    // This requires a coarse quantizer search first
+    int use_nprobe = getCurrentNProbe_(params);
+    auto stream = resources_->getDefaultStream(config_.device);
+
+    // Allocate space for coarse quantizer results
+    std::vector<idx_t> coarseIndices(n * use_nprobe);
+    std::vector<float> coarseDistances(n * use_nprobe);
+
+    // Perform coarse quantizer search to get which lists we need
+    quantizer->search(
+            n,
+            x,
+            use_nprobe,
+            coarseDistances.data(),
+            coarseIndices.data());
+
+    // Deduplicate the list IDs we need to access
+    std::unordered_set<idx_t> uniqueListIds(
+            coarseIndices.begin(), coarseIndices.end());
+    std::vector<idx_t> listIdsToCheck(uniqueListIds.begin(), uniqueListIds.end());
+
+    // Fetch any missing lists from CPU cache
+    // Note: we cast away const here because auto-fetch modifies internal state
+    // This is acceptable because the logical result of the search doesn't change
+    const_cast<GpuIndexIVFFlat*>(this)->fetchMissingListsForSearch_(
+            listIdsToCheck);
+
+    // Now perform the actual search
+    GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
 }
 
 void GpuIndexIVFFlat::train(idx_t n, const float* x) {

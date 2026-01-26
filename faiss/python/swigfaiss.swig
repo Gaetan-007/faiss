@@ -366,6 +366,7 @@ void gpu_sync_all_devices();
 #include <faiss/gpu/GpuCloner.h>
 #include <faiss/gpu/GpuDistance.h>
 #include <faiss/gpu/GpuIcmEncoder.h>
+#include <stdexcept>
 
 int get_num_gpus()
 {
@@ -687,6 +688,24 @@ struct faiss::simd16uint16 {};
 %include  <faiss/gpu/GpuIndexIVF.h>
 %include  <faiss/gpu/GpuIndexIVFPQ.h>
 %include  <faiss/gpu/GpuIndexIVFFlat.h>
+
+%inline %{
+std::vector<uint64_t> GpuIndexIVFFlat_getAutoFetchStatsVector(
+        const faiss::gpu::GpuIndexIVFFlat* index) {
+    if (!index) {
+        throw std::runtime_error(
+                "GpuIndexIVFFlat_getAutoFetchStatsVector: index is null");
+    }
+    auto stats = index->getAutoFetchStats();
+    std::vector<uint64_t> out;
+    out.reserve(3);
+    out.push_back(stats.totalFetches);
+    out.push_back(stats.totalListsFetched);
+    out.push_back(stats.totalBytesFetched);
+    return out;
+}
+%}
+
 %include  <faiss/gpu/GpuIndexIVFScalarQuantizer.h>
 %include  <faiss/gpu/GpuIndexBinaryFlat.h>
 %include  <faiss/gpu/GpuDistance.h>

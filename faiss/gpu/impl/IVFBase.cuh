@@ -47,6 +47,20 @@ class IVFBase {
     /// and the product quantizer info
     virtual void reset();
 
+    /// Evict a single IVF list from GPU memory and return reclaimed bytes
+    /// (list data + list indices allocation capacity)
+    /// NOTE: (wangzehao) This function is used to evict a single IVF list from GPU memory and return reclaimed bytes
+    size_t evictList(idx_t listId);
+
+    /// Check if a single IVF list data is currently resident on GPU
+    /// NOTE: (wangzehao) This function is used to check if a single IVF list is on GPU (for page-fault style management)
+    bool isListOnGpu(idx_t listId) const;
+
+    /// Check which lists from the given set are NOT on GPU (evicted)
+    /// Returns a vector of listIds that need to be loaded
+    /// NOTE: (wangzehao) This function is used to find missing lists for auto-fetch
+    std::vector<idx_t> findMissingLists(const std::vector<idx_t>& listIds) const;
+
     /// Return the number of dimensions we are indexing
     idx_t getDim() const;
 
@@ -73,6 +87,14 @@ class IVFBase {
 
     /// Copy all inverted lists from ourselves to a CPU representation
     virtual void copyInvertedListsTo(InvertedLists* ivf);
+
+    /// Add a single list from CPU-encoded data into an empty GPU list
+    /// NOTE: (wangzehao) This function is used to add a single list from CPU-encoded data into an empty GPU list
+    void addEncodedVectorsToListFromCpu(
+            idx_t listId,
+            const void* codes,
+            const idx_t* indices,
+            idx_t numVecs);
 
     /// Update our coarse quantizer with this quantizer instance; may be a CPU
     /// or GPU quantizer
