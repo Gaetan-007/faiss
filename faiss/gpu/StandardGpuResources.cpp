@@ -29,13 +29,27 @@
 #include <memory>
 #endif
 
+#include <faiss/gpu/MemoryPoolIPC.h>
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/utils/DeviceUtils.h>
 #include <faiss/gpu/utils/StaticUtils.h>
 #include <faiss/impl/FaissAssert.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <sstream>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 namespace faiss {
 namespace gpu {
@@ -85,6 +99,525 @@ std::string allocsToString(const std::unordered_map<void*, AllocRequest>& map) {
 
 } // namespace
 
+// Default minimum chunk size for elastic scaling (256 MiB)
+constexpr size_t kDefaultMinChunkSize = (size_t)256 * 1024 * 1024;
+
+// IPC polling interval in milliseconds
+constexpr int kIPCPollIntervalMs = 10;
+
+/// A single memory chunk within the preallocated pool.
+struct MemoryChunk {
+    void* base;      // Base address of this chunk
+    size_t size;     // Total size of this chunk
+    size_t usedBytes; // Currently allocated bytes within this chunk
+    int chunkId;     // Unique identifier
+    std::map<char*, size_t> freeBlocks; // Free blocks within this chunk
+
+    MemoryChunk() : base(nullptr), size(0), usedBytes(0), chunkId(-1) {}
+
+    bool isFullyFree() const {
+        return usedBytes == 0;
+    }
+
+    bool owns(const void* p) const {
+        if (!base || !p) {
+            return false;
+        }
+        const char* basePtr = static_cast<const char*>(base);
+        const char* ptr = static_cast<const char*>(p);
+        return ptr >= basePtr && ptr < (basePtr + size);
+    }
+};
+
+// NOTE:(wangzehao) PreallocMemoryPool is a class that manages a pool of memory
+// with support for online elastic scaling via shared memory IPC.
+class PreallocMemoryPool {
+   public:
+    PreallocMemoryPool(int device, size_t initialSize, bool enableIPC = true)
+            : device_(device),
+              totalSize_(0),
+              minChunkSize_(kDefaultMinChunkSize),
+              nextChunkId_(0),
+              shmFd_(-1),
+              shmPtr_(nullptr),
+              stopPolling_(false) {
+        // Allocate initial chunk if size > 0
+        if (initialSize > 0) {
+            size_t alignedSize = utils::roundUp(initialSize, (size_t)256);
+            DeviceScope scope(device_);
+
+            void* base = nullptr;
+            auto err = cudaMalloc(&base, alignedSize);
+            FAISS_ASSERT_FMT(
+                    err == cudaSuccess,
+                    "Failed to pre-allocate device memory pool (size %zu) on "
+                    "device %d (error %d %s)",
+                    alignedSize,
+                    device_,
+                    (int)err,
+                    cudaGetErrorString(err));
+
+            auto chunk = std::make_unique<MemoryChunk>();
+            chunk->base = base;
+            chunk->size = alignedSize;
+            chunk->usedBytes = 0;
+            chunk->chunkId = nextChunkId_++;
+            chunk->freeBlocks.emplace(static_cast<char*>(base), alignedSize);
+
+            chunks_.push_back(std::move(chunk));
+            totalSize_ = alignedSize;
+        }
+
+        // Initialize shared memory IPC if enabled
+        if (enableIPC) {
+            initSharedMemory();
+            startPollingThread();
+        }
+    }
+
+    ~PreallocMemoryPool() {
+        // Stop the polling thread first
+        stopPollingThread();
+
+        // Clean up shared memory
+        cleanupSharedMemory();
+
+        // Free all chunks
+        DeviceScope scope(device_);
+        for (auto& chunk : chunks_) {
+            if (chunk && chunk->base) {
+                auto err = cudaFree(chunk->base);
+                if (err != cudaSuccess) {
+                    std::cerr << "Warning: Failed to free chunk " << chunk->chunkId
+                              << " on device " << device_ << " (error "
+                              << cudaGetErrorString(err) << ")\n";
+                }
+            }
+        }
+        chunks_.clear();
+        totalSize_ = 0;
+    }
+
+    /// Check if pointer belongs to any chunk in the pool
+    bool owns(const void* p) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ownsLocked(p);
+    }
+
+    /// Get total available (free) memory across all chunks
+    size_t getSizeAvailable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return getSizeAvailableLocked();
+    }
+
+    /// Get total pool size
+    size_t getTotalSize() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return totalSize_;
+    }
+
+    /// Allocate memory from the pool (first-fit across chunks)
+    void* allocate(size_t size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return allocateLocked(size);
+    }
+
+    /// Deallocate memory back to the pool
+    void deallocate(void* p, size_t size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        deallocateLocked(p, size);
+    }
+
+    /// Expand the pool to at least targetSize bytes
+    ResizeResult expand(size_t targetSize) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return expandLocked(targetSize);
+    }
+
+    /// Shrink the pool to at most targetSize bytes (only frees fully-free chunks)
+    ResizeResult shrink(size_t targetSize) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return shrinkLocked(targetSize);
+    }
+
+    /// Query current pool state
+    ResizeResult query() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {ResizeStatus::Success, totalSize_, getSizeAvailableLocked(), ""};
+    }
+
+   private:
+    bool ownsLocked(const void* p) const {
+        for (const auto& chunk : chunks_) {
+            if (chunk && chunk->owns(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t getSizeAvailableLocked() const {
+        size_t total = 0;
+        for (const auto& chunk : chunks_) {
+            for (const auto& entry : chunk->freeBlocks) {
+                total += entry.second;
+            }
+        }
+        return total;
+    }
+
+    void* allocateLocked(size_t size) {
+        if (size == 0 || totalSize_ == 0) {
+            return nullptr;
+        }
+
+        size = utils::roundUp(size, (size_t)256);
+
+        // First-fit across all chunks
+        for (auto& chunk : chunks_) {
+            for (auto it = chunk->freeBlocks.begin();
+                 it != chunk->freeBlocks.end();
+                 ++it) {
+                if (it->second >= size) {
+                    char* ptr = it->first;
+                    size_t remaining = it->second - size;
+                    chunk->freeBlocks.erase(it);
+                    if (remaining > 0) {
+                        chunk->freeBlocks.emplace(ptr + size, remaining);
+                    }
+                    chunk->usedBytes += size;
+                    return ptr;
+                }
+            }
+        }
+        return nullptr; // OOM within pool
+    }
+
+    void deallocateLocked(void* p, size_t size) {
+        if (!p || totalSize_ == 0) {
+            return;
+        }
+
+        char* ptr = static_cast<char*>(p);
+        size = utils::roundUp(size, (size_t)256);
+
+        // Find the owning chunk
+        MemoryChunk* ownerChunk = nullptr;
+        for (auto& chunk : chunks_) {
+            if (chunk->owns(ptr)) {
+                ownerChunk = chunk.get();
+                break;
+            }
+        }
+
+        FAISS_ASSERT_FMT(
+                ownerChunk != nullptr,
+                "Pointer %p does not belong to any chunk on device %d",
+                p,
+                device_);
+
+        char* chunkBase = static_cast<char*>(ownerChunk->base);
+        FAISS_ASSERT_FMT(
+                ptr + size <= chunkBase + ownerChunk->size,
+                "Invalid deallocation: pointer %p with size %zu exceeds chunk bounds",
+                p,
+                size);
+
+        auto& freeBlocks = ownerChunk->freeBlocks;
+
+        // Merge with adjacent free blocks
+        auto next = freeBlocks.lower_bound(ptr);
+        if (next != freeBlocks.begin()) {
+            auto prev = std::prev(next);
+            FAISS_ASSERT(prev->first + prev->second <= ptr);
+            if (prev->first + prev->second == ptr) {
+                ptr = prev->first;
+                size += prev->second;
+                freeBlocks.erase(prev);
+            }
+        }
+
+        if (next != freeBlocks.end()) {
+            FAISS_ASSERT(ptr + size <= next->first);
+            if (ptr + size == next->first) {
+                size += next->second;
+                freeBlocks.erase(next);
+            }
+        }
+
+        freeBlocks.emplace(ptr, size);
+        ownerChunk->usedBytes -= utils::roundUp(
+                static_cast<size_t>(static_cast<char*>(p) - ptr == 0 ? size : size),
+                (size_t)256);
+        
+        // Recalculate usedBytes properly
+        size_t totalFree = 0;
+        for (const auto& fb : ownerChunk->freeBlocks) {
+            totalFree += fb.second;
+        }
+        ownerChunk->usedBytes = ownerChunk->size - totalFree;
+    }
+
+    ResizeResult expandLocked(size_t targetSize) {
+        if (targetSize <= totalSize_) {
+            return {ResizeStatus::Success,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    ""};
+        }
+
+        size_t delta = targetSize - totalSize_;
+        delta = utils::roundUp(delta, minChunkSize_);
+
+        DeviceScope scope(device_);
+        void* newBase = nullptr;
+        auto err = cudaMalloc(&newBase, delta);
+
+        if (err != cudaSuccess) {
+            cudaGetLastError(); // Clear error
+            return {ResizeStatus::Failed,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    std::string("cudaMalloc failed: ") + cudaGetErrorString(err)};
+        }
+
+        auto chunk = std::make_unique<MemoryChunk>();
+        chunk->base = newBase;
+        chunk->size = delta;
+        chunk->usedBytes = 0;
+        chunk->chunkId = nextChunkId_++;
+        chunk->freeBlocks.emplace(static_cast<char*>(newBase), delta);
+
+        chunks_.push_back(std::move(chunk));
+        totalSize_ += delta;
+
+        return {ResizeStatus::Success, totalSize_, getSizeAvailableLocked(), ""};
+    }
+
+    ResizeResult shrinkLocked(size_t targetSize) {
+        if (targetSize >= totalSize_) {
+            return {ResizeStatus::Success,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    ""};
+        }
+
+        size_t currentUsed = totalSize_ - getSizeAvailableLocked();
+        if (targetSize < currentUsed) {
+            return {ResizeStatus::Failed,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    "Target size smaller than current usage"};
+        }
+
+        // Collect fully-free chunk indices
+        std::vector<size_t> freeableIndices;
+        for (size_t i = 0; i < chunks_.size(); ++i) {
+            if (chunks_[i]->isFullyFree()) {
+                freeableIndices.push_back(i);
+            }
+        }
+
+        // Sort by size ascending (prefer releasing smaller chunks first)
+        std::sort(
+                freeableIndices.begin(),
+                freeableIndices.end(),
+                [this](size_t a, size_t b) {
+                    return chunks_[a]->size < chunks_[b]->size;
+                });
+
+        DeviceScope scope(device_);
+
+        // Synchronize to ensure no kernels are using the memory
+        cudaDeviceSynchronize();
+
+        size_t toRelease = totalSize_ - targetSize;
+        size_t released = 0;
+        std::vector<size_t> toRemove;
+
+        for (size_t idx : freeableIndices) {
+            if (released >= toRelease) {
+                break;
+            }
+
+            auto& chunk = chunks_[idx];
+            auto err = cudaFree(chunk->base);
+            if (err != cudaSuccess) {
+                // Log warning but continue
+                std::cerr << "Warning: Failed to free chunk " << chunk->chunkId
+                          << " (error " << cudaGetErrorString(err) << ")\n";
+                continue;
+            }
+            released += chunk->size;
+            toRemove.push_back(idx);
+        }
+
+        // Remove chunks from back to front to keep indices valid
+        std::sort(toRemove.rbegin(), toRemove.rend());
+        for (size_t idx : toRemove) {
+            chunks_.erase(chunks_.begin() + idx);
+        }
+        totalSize_ -= released;
+
+        if (released >= toRelease) {
+            return {ResizeStatus::Success,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    ""};
+        } else {
+            return {ResizeStatus::Partial,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    "Some chunks still in use"};
+        }
+    }
+
+    void initSharedMemory() {
+        std::string shmName = getShmName(device_);
+
+        shmFd_ = shm_open(shmName.c_str(), O_CREAT | O_RDWR, 0666);
+        if (shmFd_ < 0) {
+            std::cerr << "Warning: Failed to open shared memory " << shmName
+                      << ": " << strerror(errno) << "\n";
+            return;
+        }
+
+        if (ftruncate(shmFd_, sizeof(ShmControlBlock)) < 0) {
+            std::cerr << "Warning: Failed to resize shared memory: "
+                      << strerror(errno) << "\n";
+            close(shmFd_);
+            shmFd_ = -1;
+            return;
+        }
+
+        shmPtr_ = mmap(
+                nullptr,
+                sizeof(ShmControlBlock),
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                shmFd_,
+                0);
+        if (shmPtr_ == MAP_FAILED) {
+            std::cerr << "Warning: Failed to mmap shared memory: "
+                      << strerror(errno) << "\n";
+            close(shmFd_);
+            shmFd_ = -1;
+            shmPtr_ = nullptr;
+            return;
+        }
+
+        // Initialize control block using helper method
+        auto* ctrl = static_cast<ShmControlBlock*>(shmPtr_);
+        ctrl->init(device_);
+        ctrl->actualSizeBytes = static_cast<int64_t>(totalSize_);
+        ctrl->availableBytes = static_cast<int64_t>(getSizeAvailableLocked());
+    }
+
+    void cleanupSharedMemory() {
+        if (shmPtr_ && shmPtr_ != MAP_FAILED) {
+            munmap(shmPtr_, sizeof(ShmControlBlock));
+            shmPtr_ = nullptr;
+        }
+        if (shmFd_ >= 0) {
+            close(shmFd_);
+            // Optionally unlink (but leave it for potential reconnection)
+            // std::string shmName = "/faiss_gpu_pool_ctrl_" + std::to_string(device_);
+            // shm_unlink(shmName.c_str());
+            shmFd_ = -1;
+        }
+    }
+
+    void startPollingThread() {
+        if (!shmPtr_) {
+            return; // IPC not initialized
+        }
+
+        stopPolling_.store(false, std::memory_order_release);
+        pollingThread_ = std::thread([this]() { pollLoop(); });
+    }
+
+    void stopPollingThread() {
+        stopPolling_.store(true, std::memory_order_release);
+        if (pollingThread_.joinable()) {
+            pollingThread_.join();
+        }
+    }
+
+    void pollLoop() {
+        if (!shmPtr_) {
+            return;
+        }
+
+        auto* ctrl = static_cast<ShmControlBlock*>(shmPtr_);
+        uint32_t lastVersion = 0;
+
+        while (!stopPolling_.load(std::memory_order_acquire)) {
+            uint32_t curVersion = ctrl->version;
+            // Use a memory fence to ensure we see consistent data
+            std::atomic_thread_fence(std::memory_order_acquire);
+
+            if (curVersion != lastVersion && ctrl->command != 0) {
+                lastVersion = curVersion;
+                processCommand(ctrl);
+            }
+
+            std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kIPCPollIntervalMs));
+        }
+    }
+
+    void processCommand(ShmControlBlock* ctrl) {
+        auto cmd = static_cast<ResizeCommand>(ctrl->command);
+        ResizeResult result;
+
+        switch (cmd) {
+            case ResizeCommand::ExpandTo:
+                result = expand(static_cast<size_t>(ctrl->targetSizeBytes));
+                break;
+            case ResizeCommand::ShrinkTo:
+                result = shrink(static_cast<size_t>(ctrl->targetSizeBytes));
+                break;
+            case ResizeCommand::Query:
+                result = query();
+                break;
+            case ResizeCommand::ExpandBy: {
+                std::lock_guard<std::mutex> lock(mutex_);
+                result = expandLocked(totalSize_ + static_cast<size_t>(ctrl->deltaBytes));
+                break;
+            }
+            case ResizeCommand::Nop:
+            default:
+                return;
+        }
+
+        // Write response
+        ctrl->status = static_cast<uint32_t>(result.status);
+        ctrl->actualSizeBytes = static_cast<int64_t>(result.actualSize);
+        ctrl->availableBytes = static_cast<int64_t>(result.availableSize);
+        ctrl->setErrorMsg(result.errorMsg);
+
+        // Memory fence before clearing command
+        std::atomic_thread_fence(std::memory_order_release);
+
+        // Clear command to signal completion
+        ctrl->command = static_cast<uint32_t>(ResizeCommand::Nop);
+    }
+
+   private:
+    int device_;
+    mutable std::mutex mutex_;
+    std::vector<std::unique_ptr<MemoryChunk>> chunks_;
+    size_t totalSize_;
+    size_t minChunkSize_;
+    int nextChunkId_;
+
+    // IPC shared memory
+    int shmFd_;
+    void* shmPtr_;
+    std::atomic<bool> stopPolling_;
+    std::thread pollingThread_;
+};
+
 //
 // StandardGpuResourcesImpl
 //
@@ -102,6 +635,7 @@ StandardGpuResourcesImpl::StandardGpuResourcesImpl()
           tempMemSize_(getDefaultTempMemForGPU(
                   -1,
                   std::numeric_limits<size_t>::max())),
+          deviceMemSize_(0),
           pinnedMemSize_(kDefaultPinnedMemoryAllocation),
           allocLogging_(false) {
 }
@@ -129,6 +663,8 @@ StandardGpuResourcesImpl::~StandardGpuResourcesImpl() {
 
     FAISS_ASSERT_MSG(
             !allocError, "GPU memory allocations not properly cleaned up");
+
+    preallocPools_.clear();
 
 #if defined USE_NVIDIA_CUVS
     raftHandles_.clear();
@@ -239,6 +775,14 @@ void StandardGpuResourcesImpl::setTempMemory(size_t size) {
                     getDefaultTempMemForGPU(device, tempMemSize_));
         }
     }
+}
+
+void StandardGpuResourcesImpl::setDeviceMemoryReservation(size_t size) {
+    // Should not call this after devices have been initialized
+    FAISS_ASSERT(defaultStreams_.size() == 0);
+    FAISS_ASSERT(preallocPools_.empty());
+
+    deviceMemSize_ = size;
 }
 
 void StandardGpuResourcesImpl::setPinnedMemory(size_t size) {
@@ -445,6 +989,14 @@ void StandardGpuResourcesImpl::initializeForDevice(int device) {
     FAISS_ASSERT(allocs_.count(device) == 0);
     allocs_[device] = std::unordered_map<void*, AllocRequest>();
 
+    if (deviceMemSize_ > 0) {
+        FAISS_ASSERT(preallocPools_.count(device) == 0);
+        preallocPools_.emplace(
+                device,
+                std::make_unique<PreallocMemoryPool>(
+                        device, deviceMemSize_, true /* enableIPC */));
+    }
+
     FAISS_ASSERT(tempMemory_.count(device) == 0);
     auto mem = std::make_unique<StackDeviceMemory>(
             this,
@@ -507,6 +1059,68 @@ cudaStream_t StandardGpuResourcesImpl::getAsyncCopyStream(int device) {
     return asyncCopyStreams_[device];
 }
 
+bool StandardGpuResourcesImpl::requestDeviceMemoryReservationResize(
+        int device,
+        size_t newSize,
+        bool allowShrink) {
+    initializeForDevice(device);
+
+    auto it = preallocPools_.find(device);
+    if (it == preallocPools_.end() || !it->second) {
+        // No preallocated pool for this device
+        return false;
+    }
+
+    auto* pool = it->second.get();
+    size_t currentSize = pool->getTotalSize();
+
+    if (newSize > currentSize) {
+        // Expand
+        auto result = pool->expand(newSize);
+        return result.isSuccess();
+    } else if (newSize < currentSize && allowShrink) {
+        // Shrink
+        auto result = pool->shrink(newSize);
+        return result.isSuccess() || result.isPartial();
+    }
+
+    // No change needed
+    return true;
+}
+
+void StandardGpuResourcesImpl::setPreallocPoolIpc(
+        const std::string& /* name */,
+        size_t /* capacity */) {
+    // IPC is handled internally by the PreallocMemoryPool
+    // This is a no-op for StandardGpuResourcesImpl as the pool
+    // already initializes its own shared memory IPC
+}
+
+size_t StandardGpuResourcesImpl::pollPreallocPoolIpc() {
+    // IPC polling is handled internally by the PreallocMemoryPool's
+    // background thread. This is a no-op that returns 0.
+    return 0;
+}
+
+std::map<int, PreallocPoolStats> StandardGpuResourcesImpl::getPreallocPoolStats()
+        const {
+    std::map<int, PreallocPoolStats> stats;
+
+    for (const auto& kv : preallocPools_) {
+        if (kv.second) {
+            PreallocPoolStats s;
+            s.totalBytes = kv.second->getTotalSize();
+            s.freeBytes = kv.second->getSizeAvailable();
+            s.slabCount = 0;  // Not tracked in current implementation
+            s.targetBytes = s.totalBytes;
+            s.shrinkPending = false;
+            stats[kv.first] = s;
+        }
+    }
+
+    return stats;
+}
+
 void* StandardGpuResourcesImpl::allocMemory(const AllocRequest& req) {
     initializeForDevice(req.device);
 
@@ -521,11 +1135,28 @@ void* StandardGpuResourcesImpl::allocMemory(const AllocRequest& req) {
     adjReq.size = utils::roundUp(adjReq.size, (size_t)256);
 
     void* p = nullptr;
+    auto poolIt = preallocPools_.find(adjReq.device);
+    bool usePrealloc = (deviceMemSize_ > 0);
+    if (usePrealloc) {
+        FAISS_ASSERT(poolIt != preallocPools_.end());
+    }
 
     if (adjReq.space == MemorySpace::Temporary) {
         auto& tempMem = tempMemory_[adjReq.device];
 
         if (adjReq.size > tempMem->getSizeAvailable()) {
+            if (usePrealloc) {
+                std::stringstream ss;
+                ss << "StandardGpuResources: temp alloc fail "
+                   << adjReq.toString()
+                   << " (no temp space; preallocated pool enforced)\n";
+                auto str = ss.str();
+                if (allocLogging_) {
+                    std::cout << str;
+                }
+                FAISS_ASSERT_FMT(false, "%s", str.c_str());
+            }
+
             // We need to allocate this ourselves
             AllocRequest newReq = adjReq;
             newReq.space = MemorySpace::Device;
@@ -544,40 +1175,63 @@ void* StandardGpuResourcesImpl::allocMemory(const AllocRequest& req) {
         // Otherwise, we can handle this locally
         p = tempMemory_[adjReq.device]->allocMemory(adjReq.stream, adjReq.size);
     } else if (adjReq.space == MemorySpace::Device) {
-#if defined USE_NVIDIA_CUVS
-        try {
-            rmm::mr::device_memory_resource* current_mr =
-                    rmm::mr::get_per_device_resource(
-                            rmm::cuda_device_id{adjReq.device});
-            p = current_mr->allocate_async(adjReq.size, adjReq.stream);
-            adjReq.mr = current_mr;
-        } catch (const std::bad_alloc& rmm_ex) {
-            FAISS_THROW_MSG("CUDA memory allocation error");
-        }
-#else
-        auto err = cudaMalloc(&p, adjReq.size);
-
-        // Throw if we fail to allocate
-        if (err != cudaSuccess) {
-            // FIXME: as of CUDA 11, a memory allocation error appears to be
-            // presented via cudaGetLastError as well, and needs to be
-            // cleared. Just call the function to clear it
-            cudaGetLastError();
-
-            std::stringstream ss;
-            ss << "StandardGpuResources: alloc fail " << adjReq.toString()
-               << " (cudaMalloc error " << cudaGetErrorString(err) << " ["
-               << (int)err << "])\n";
-            auto str = ss.str();
-
-            if (allocLogging_) {
-                std::cout << str;
+        if (usePrealloc) {
+            auto* pool = poolIt->second.get();
+            FAISS_ASSERT(pool);
+            p = pool->allocate(adjReq.size);
+            if (!p) {
+                std::stringstream ss;
+                ss << "StandardGpuResources: device alloc fail "
+                   << adjReq.toString()
+                   << " (preallocated pool exhausted; available "
+                   << pool->getSizeAvailable() << " bytes)\n";
+                auto str = ss.str();
+                if (allocLogging_) {
+                    std::cout << str;
+                }
+                FAISS_ASSERT_FMT(false, "%s", str.c_str());
             }
+        } else {
+#if defined USE_NVIDIA_CUVS
+            try {
+                rmm::mr::device_memory_resource* current_mr =
+                        rmm::mr::get_per_device_resource(
+                                rmm::cuda_device_id{adjReq.device});
+                p = current_mr->allocate_async(adjReq.size, adjReq.stream);
+                adjReq.mr = current_mr;
+            } catch (const std::bad_alloc& rmm_ex) {
+                FAISS_THROW_MSG("CUDA memory allocation error");
+            }
+#else
+            auto err = cudaMalloc(&p, adjReq.size);
 
-            FAISS_THROW_IF_NOT_FMT(err == cudaSuccess, "%s", str.c_str());
-        }
+            // Throw if we fail to allocate
+            if (err != cudaSuccess) {
+                // FIXME: as of CUDA 11, a memory allocation error appears to be
+                // presented via cudaGetLastError as well, and needs to be
+                // cleared. Just call the function to clear it
+                cudaGetLastError();
+
+                std::stringstream ss;
+                ss << "StandardGpuResources: alloc fail " << adjReq.toString()
+                   << " (cudaMalloc error " << cudaGetErrorString(err) << " ["
+                   << (int)err << "])\n";
+                auto str = ss.str();
+
+                if (allocLogging_) {
+                    std::cout << str;
+                }
+
+                FAISS_THROW_IF_NOT_FMT(err == cudaSuccess, "%s", str.c_str());
+            }
 #endif
+        }
     } else if (adjReq.space == MemorySpace::Unified) {
+        if (usePrealloc) {
+            FAISS_THROW_MSG(
+                    "Unified memory allocation is not supported when device "
+                    "memory reservation is enabled");
+        }
 #if defined USE_NVIDIA_CUVS
         try {
             // for now, use our own managed MR to do Unified Memory allocations.
@@ -644,9 +1298,36 @@ void StandardGpuResourcesImpl::deallocMemory(int device, void* p) {
 
     if (req.space == MemorySpace::Temporary) {
         tempMemory_[device]->deallocMemory(device, req.stream, req.size, p);
-    } else if (
-            req.space == MemorySpace::Device ||
-            req.space == MemorySpace::Unified) {
+    } else if (req.space == MemorySpace::Device) {
+        if (deviceMemSize_ > 0) {
+            auto poolIt = preallocPools_.find(device);
+            FAISS_ASSERT(poolIt != preallocPools_.end());
+            auto* pool = poolIt->second.get();
+            FAISS_ASSERT(pool);
+            FAISS_ASSERT_FMT(
+                    pool->owns(p),
+                    "Pointer does not belong to preallocated pool on device %d",
+                    device);
+            pool->deallocate(p, req.size);
+        } else {
+#if defined USE_NVIDIA_CUVS
+            req.mr->deallocate_async(p, req.size, req.stream);
+#else
+            auto err = cudaFree(p);
+            FAISS_ASSERT_FMT(
+                    err == cudaSuccess,
+                    "Failed to cudaFree pointer %p (error %d %s)",
+                    p,
+                    (int)err,
+                    cudaGetErrorString(err));
+#endif
+        }
+    } else if (req.space == MemorySpace::Unified) {
+        if (deviceMemSize_ > 0) {
+            FAISS_THROW_MSG(
+                    "Unified memory deallocation not supported when device "
+                    "memory reservation is enabled");
+        }
 #if defined USE_NVIDIA_CUVS
         req.mr->deallocate_async(p, req.size, req.stream);
 #else
@@ -722,6 +1403,10 @@ void StandardGpuResources::noTempMemory() {
 
 void StandardGpuResources::setTempMemory(size_t size) {
     res_->setTempMemory(size);
+}
+
+void StandardGpuResources::setDeviceMemoryReservation(size_t size) {
+    res_->setDeviceMemoryReservation(size);
 }
 
 void StandardGpuResources::setPinnedMemory(size_t size) {

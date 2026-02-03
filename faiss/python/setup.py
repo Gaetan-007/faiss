@@ -11,16 +11,38 @@ import shutil
 
 from setuptools import setup
 
+# Get the directory where this setup.py file is located
+setup_dir = os.path.dirname(os.path.abspath(__file__))
+
 # make the faiss python package dir
 shutil.rmtree("faiss", ignore_errors=True)
 os.mkdir("faiss")
-shutil.copytree("contrib", "faiss/contrib")
-shutil.copyfile("__init__.py", "faiss/__init__.py")
-shutil.copyfile("loader.py", "faiss/loader.py")
-shutil.copyfile("class_wrappers.py", "faiss/class_wrappers.py")
-shutil.copyfile("gpu_wrappers.py", "faiss/gpu_wrappers.py")
-shutil.copyfile("extra_wrappers.py", "faiss/extra_wrappers.py")
-shutil.copyfile("array_conversions.py", "faiss/array_conversions.py")
+
+# Copy files using absolute paths based on setup.py location
+if os.path.exists(os.path.join(setup_dir, "contrib")):
+    shutil.copytree(os.path.join(setup_dir, "contrib"), "faiss/contrib")
+
+shutil.copyfile(os.path.join(setup_dir, "__init__.py"), "faiss/__init__.py")
+shutil.copyfile(os.path.join(setup_dir, "loader.py"), "faiss/loader.py")
+shutil.copyfile(os.path.join(setup_dir, "class_wrappers.py"), "faiss/class_wrappers.py")
+shutil.copyfile(os.path.join(setup_dir, "gpu_wrappers.py"), "faiss/gpu_wrappers.py")
+shutil.copyfile(os.path.join(setup_dir, "extra_wrappers.py"), "faiss/extra_wrappers.py")
+shutil.copyfile(os.path.join(setup_dir, "array_conversions.py"), "faiss/array_conversions.py")
+gpu_pool_controller_src = os.path.join(setup_dir, "gpu_pool_controller.py")
+if os.path.exists(gpu_pool_controller_src):
+    shutil.copyfile(gpu_pool_controller_src, "faiss/gpu_pool_controller.py")
+
+# Copy utils.py only if it exists
+utils_src = os.path.join(setup_dir, "utils.py")
+if os.path.exists(utils_src):
+    shutil.copyfile(utils_src, "faiss/utils.py")
+
+has_engine = os.path.exists(os.path.join(setup_dir, "engine"))
+has_server = os.path.exists(os.path.join(setup_dir, "server"))
+if has_engine:
+    shutil.copytree(os.path.join(setup_dir, "engine"), "faiss/engine")
+if has_server:
+    shutil.copytree(os.path.join(setup_dir, "server"), "faiss/server")
 
 if platform.system() != "AIX":
     ext = ".pyd" if platform.system() == "Windows" else ".so"
@@ -36,14 +58,14 @@ callbacks_lib = f"{prefix}libfaiss_python_callbacks{ext}"
 swigfaiss_sve_lib = f"{prefix}_swigfaiss_sve{ext}"
 faiss_example_external_module_lib = f"_faiss_example_external_module{ext}"
 
-found_swigfaiss_generic = os.path.exists(swigfaiss_generic_lib)
-found_swigfaiss_avx2 = os.path.exists(swigfaiss_avx2_lib)
-found_swigfaiss_avx512 = os.path.exists(swigfaiss_avx512_lib)
-found_swigfaiss_avx512_spr = os.path.exists(swigfaiss_avx512_spr_lib)
-found_callbacks = os.path.exists(callbacks_lib)
-found_swigfaiss_sve = os.path.exists(swigfaiss_sve_lib)
+found_swigfaiss_generic = os.path.exists(os.path.join(setup_dir, swigfaiss_generic_lib))
+found_swigfaiss_avx2 = os.path.exists(os.path.join(setup_dir, swigfaiss_avx2_lib))
+found_swigfaiss_avx512 = os.path.exists(os.path.join(setup_dir, swigfaiss_avx512_lib))
+found_swigfaiss_avx512_spr = os.path.exists(os.path.join(setup_dir, swigfaiss_avx512_spr_lib))
+found_callbacks = os.path.exists(os.path.join(setup_dir, callbacks_lib))
+found_swigfaiss_sve = os.path.exists(os.path.join(setup_dir, swigfaiss_sve_lib))
 found_faiss_example_external_module_lib = os.path.exists(
-    faiss_example_external_module_lib
+    os.path.join(setup_dir, faiss_example_external_module_lib)
 )
 
 if platform.system() != "AIX":
@@ -62,42 +84,66 @@ if platform.system() != "AIX":
 
 if found_swigfaiss_generic:
     print(f"Copying {swigfaiss_generic_lib}")
-    shutil.copyfile("swigfaiss.py", "faiss/swigfaiss.py")
-    shutil.copyfile(swigfaiss_generic_lib, f"faiss/_swigfaiss{ext}")
+    swigfaiss_py = os.path.join(setup_dir, "swigfaiss.py")
+    if os.path.exists(swigfaiss_py):
+        shutil.copyfile(swigfaiss_py, "faiss/swigfaiss.py")
+    swigfaiss_lib_path = os.path.join(setup_dir, swigfaiss_generic_lib)
+    if os.path.exists(swigfaiss_lib_path):
+        shutil.copyfile(swigfaiss_lib_path, f"faiss/_swigfaiss{ext}")
 
 if found_swigfaiss_avx2:
     print(f"Copying {swigfaiss_avx2_lib}")
-    shutil.copyfile("swigfaiss_avx2.py", "faiss/swigfaiss_avx2.py")
-    shutil.copyfile(swigfaiss_avx2_lib, f"faiss/_swigfaiss_avx2{ext}")
+    swigfaiss_avx2_py = os.path.join(setup_dir, "swigfaiss_avx2.py")
+    if os.path.exists(swigfaiss_avx2_py):
+        shutil.copyfile(swigfaiss_avx2_py, "faiss/swigfaiss_avx2.py")
+    swigfaiss_avx2_lib_path = os.path.join(setup_dir, swigfaiss_avx2_lib)
+    if os.path.exists(swigfaiss_avx2_lib_path):
+        shutil.copyfile(swigfaiss_avx2_lib_path, f"faiss/_swigfaiss_avx2{ext}")
 
 if found_swigfaiss_avx512:
     print(f"Copying {swigfaiss_avx512_lib}")
-    shutil.copyfile("swigfaiss_avx512.py", "faiss/swigfaiss_avx512.py")
-    shutil.copyfile(swigfaiss_avx512_lib, f"faiss/_swigfaiss_avx512{ext}")
+    swigfaiss_avx512_py = os.path.join(setup_dir, "swigfaiss_avx512.py")
+    if os.path.exists(swigfaiss_avx512_py):
+        shutil.copyfile(swigfaiss_avx512_py, "faiss/swigfaiss_avx512.py")
+    swigfaiss_avx512_lib_path = os.path.join(setup_dir, swigfaiss_avx512_lib)
+    if os.path.exists(swigfaiss_avx512_lib_path):
+        shutil.copyfile(swigfaiss_avx512_lib_path, f"faiss/_swigfaiss_avx512{ext}")
 
 if found_swigfaiss_avx512_spr:
     print(f"Copying {swigfaiss_avx512_spr_lib}")
-    shutil.copyfile("swigfaiss_avx512_spr.py", "faiss/swigfaiss_avx512_spr.py")
-    shutil.copyfile(swigfaiss_avx512_spr_lib, f"faiss/_swigfaiss_avx512_spr{ext}")
+    swigfaiss_avx512_spr_py = os.path.join(setup_dir, "swigfaiss_avx512_spr.py")
+    if os.path.exists(swigfaiss_avx512_spr_py):
+        shutil.copyfile(swigfaiss_avx512_spr_py, "faiss/swigfaiss_avx512_spr.py")
+    swigfaiss_avx512_spr_lib_path = os.path.join(setup_dir, swigfaiss_avx512_spr_lib)
+    if os.path.exists(swigfaiss_avx512_spr_lib_path):
+        shutil.copyfile(swigfaiss_avx512_spr_lib_path, f"faiss/_swigfaiss_avx512_spr{ext}")
 
 if found_callbacks:
     print(f"Copying {callbacks_lib}")
-    shutil.copyfile(callbacks_lib, f"faiss/{callbacks_lib}")
+    callbacks_lib_path = os.path.join(setup_dir, callbacks_lib)
+    if os.path.exists(callbacks_lib_path):
+        shutil.copyfile(callbacks_lib_path, f"faiss/{callbacks_lib}")
 
 if found_swigfaiss_sve:
     print(f"Copying {swigfaiss_sve_lib}")
-    shutil.copyfile("swigfaiss_sve.py", "faiss/swigfaiss_sve.py")
-    shutil.copyfile(swigfaiss_sve_lib, f"faiss/_swigfaiss_sve{ext}")
+    swigfaiss_sve_py = os.path.join(setup_dir, "swigfaiss_sve.py")
+    if os.path.exists(swigfaiss_sve_py):
+        shutil.copyfile(swigfaiss_sve_py, "faiss/swigfaiss_sve.py")
+    swigfaiss_sve_lib_path = os.path.join(setup_dir, swigfaiss_sve_lib)
+    if os.path.exists(swigfaiss_sve_lib_path):
+        shutil.copyfile(swigfaiss_sve_lib_path, f"faiss/_swigfaiss_sve{ext}")
 
 if found_faiss_example_external_module_lib:
     print(f"Copying {faiss_example_external_module_lib}")
-    shutil.copyfile(
-        "faiss_example_external_module.py", "faiss/faiss_example_external_module.py"
-    )
-    shutil.copyfile(
-        faiss_example_external_module_lib,
-        f"faiss/_faiss_example_external_module{ext}",
-    )
+    faiss_example_py = os.path.join(setup_dir, "faiss_example_external_module.py")
+    if os.path.exists(faiss_example_py):
+        shutil.copyfile(faiss_example_py, "faiss/faiss_example_external_module.py")
+    faiss_example_lib_path = os.path.join(setup_dir, faiss_example_external_module_lib)
+    if os.path.exists(faiss_example_lib_path):
+        shutil.copyfile(
+            faiss_example_lib_path,
+            f"faiss/_faiss_example_external_module{ext}",
+        )
 
 long_description = """
 Faiss is a library for efficient similarity search and clustering of dense
@@ -107,6 +153,14 @@ code for evaluation and parameter tuning. Faiss is written in C++ with
 complete wrappers for Python/numpy. Some of the most useful algorithms
 are implemented on the GPU. It is developed by Facebook AI Research.
 """
+packages_list = ["faiss"]
+if os.path.exists(os.path.join(setup_dir, "contrib")):
+    packages_list.extend(["faiss.contrib", "faiss.contrib.torch"])
+if has_engine:
+    packages_list.append("faiss.engine")
+if has_server:
+    packages_list.append("faiss.server")
+
 setup(
     name="faiss",
     version="1.13.2",
@@ -119,7 +173,7 @@ setup(
     license="MIT",
     keywords="search nearest neighbors",
     install_requires=["numpy", "packaging"],
-    packages=["faiss", "faiss.contrib", "faiss.contrib.torch"],
+    packages=packages_list,
     package_data={
         "faiss": ["*.so", "*.pyd", "*.a"],
     },

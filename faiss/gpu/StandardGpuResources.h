@@ -40,6 +40,9 @@
 namespace faiss {
 namespace gpu {
 
+/// NOTE:(wangzehao) PreallocMemoryPool is a class that manages a pool of memory
+class PreallocMemoryPool;
+
 /// Standard implementation of the GpuResources object that provides for a
 /// temporary memory manager
 class StandardGpuResourcesImpl : public GpuResources {
@@ -61,6 +64,11 @@ class StandardGpuResourcesImpl : public GpuResources {
     /// smaller GPUs (with <= 4 GiB or <= 8 GiB) will use less memory than that.
     /// To avoid any temporary memory allocation, pass 0.
     void setTempMemory(size_t size);
+
+    /// Specify an amount of device memory to pre-allocate per GPU.
+    /// If > 0, all device and temporary allocations must fit within this
+    /// reservation; overflow will assert.
+    void setDeviceMemoryReservation(size_t size);
 
     /// Set amount of pinned memory to allocate, for async GPU <-> CPU
     /// transfers
@@ -123,6 +131,23 @@ class StandardGpuResourcesImpl : public GpuResources {
 
     cudaStream_t getAsyncCopyStream(int device) override;
 
+    /// Request a resize of the device memory reservation pool
+    bool requestDeviceMemoryReservationResize(
+            int device,
+            size_t newSize,
+            bool allowShrink) override;
+
+    /// Attach to a shared memory IPC command queue for pool resize
+    void setPreallocPoolIpc(
+            const std::string& name,
+            size_t capacity) override;
+
+    /// Poll IPC queue and apply resize commands
+    size_t pollPreallocPoolIpc() override;
+
+    /// Return prealloc pool stats for all devices
+    std::map<int, PreallocPoolStats> getPreallocPoolStats() const override;
+
    protected:
     /// Have GPU resources been initialized for this device yet?
     bool isInitialized(int device) const;
@@ -138,6 +163,10 @@ class StandardGpuResourcesImpl : public GpuResources {
 
     /// Temporary memory provider, per each device
     std::unordered_map<int, std::unique_ptr<StackDeviceMemory>> tempMemory_;
+
+    /// Pre-allocated device memory pool, per each device
+    std::unordered_map<int, std::unique_ptr<PreallocMemoryPool>>
+            preallocPools_;
 
     /// Our default stream that work is ordered on, one per each device
     std::unordered_map<int, cudaStream_t> defaultStreams_;
@@ -184,6 +213,9 @@ class StandardGpuResourcesImpl : public GpuResources {
     /// devices
     size_t tempMemSize_;
 
+    /// Amount of device memory we should pre-allocate per device
+    size_t deviceMemSize_;
+
     /// Amount of pinned memory we should allocate
     size_t pinnedMemSize_;
 
@@ -218,6 +250,11 @@ class StandardGpuResources : public GpuResourcesProvider {
     /// smaller GPUs (with <= 4 GiB or <= 8 GiB) will use less memory than that.
     /// To avoid any temporary memory allocation, pass 0.
     void setTempMemory(size_t size);
+
+    /// Specify an amount of device memory to pre-allocate per GPU.
+    /// If > 0, all device and temporary allocations must fit within this
+    /// reservation; overflow will assert.
+    void setDeviceMemoryReservation(size_t size);
 
     /// Set amount of pinned memory to allocate, for async GPU <-> CPU
     /// transfers

@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
@@ -154,6 +155,107 @@ void GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
 
     // Copy all of the IVF data
     index_->copyInvertedListsFrom(index->invlists);
+}
+
+void GpuIndexIVFFlat::copyFromSelective(
+        const faiss::IndexIVFFlat* index,
+        const std::vector<idx_t>& listIds) {
+    DeviceScope scope(config_.device);
+
+    FAISS_THROW_IF_NOT_MSG(index, "copyFromSelective: index must not be null");
+
+    // This will copy GpuIndexIVF data such as the coarse quantizer
+    GpuIndexIVF::copyFrom(index);
+
+    // Clear out our old data
+    index_.reset();
+
+    // skip base class allocations if cuVS is enabled
+    if (!should_use_cuvs(config_)) {
+        baseIndex_.reset();
+    }
+    cpuListCache_.clear();
+
+    // The other index might not be trained
+    if (!index->is_trained) {
+        FAISS_ASSERT(!is_trained);
+        return;
+    }
+
+    // Otherwise, we can populate ourselves from the other index
+    FAISS_ASSERT(is_trained);
+
+    // Copy our lists as well
+    setIndex_(
+            resources_.get(),
+            d,
+            nlist,
+            index->metric_type,
+            index->metric_arg,
+            false,   // no residual
+            nullptr, // no scalar quantizer
+            ivfFlatConfig_.interleavedLayout,
+            ivfFlatConfig_.indicesOptions,
+            config_.memorySpace);
+    baseIndex_ = std::static_pointer_cast<IVFBase, IVFFlat>(index_);
+    updateQuantizer();
+
+    auto* invlists = index->invlists;
+    FAISS_THROW_IF_NOT_MSG(
+            invlists, "copyFromSelective: source index has no invlists");
+    FAISS_THROW_IF_NOT_MSG(
+            invlists->nlist == nlist,
+            "copyFromSelective: invlists nlist mismatch");
+
+    std::unordered_set<idx_t> listsToLoad;
+    listsToLoad.reserve(listIds.size());
+    for (auto listId : listIds) {
+        FAISS_THROW_IF_NOT_FMT(
+                listId >= 0 && listId < nlist,
+                "copyFromSelective: list %ld out of bounds (%ld lists total)",
+                listId,
+                nlist);
+        listsToLoad.insert(listId);
+    }
+
+    for (idx_t listId = 0; listId < nlist; ++listId) {
+        auto numVecs = invlists->list_size(listId);
+        if (numVecs == 0) {
+            // No data to load or cache
+            continue;
+        }
+
+        const auto* codes =
+                reinterpret_cast<const uint8_t*>(invlists->get_codes(listId));
+        const auto* ids = invlists->get_ids(listId);
+        const size_t codesBytes =
+                static_cast<size_t>(numVecs) * index->code_size;
+
+        FAISS_THROW_IF_NOT_MSG(
+                codes,
+                "copyFromSelective: null codes for a non-empty list");
+        if (ivfFlatConfig_.indicesOptions != INDICES_IVF) {
+            FAISS_THROW_IF_NOT_MSG(
+                    ids,
+                    "copyFromSelective: null ids for a non-empty list");
+        }
+
+        if (listsToLoad.count(listId) > 0) {
+            index_->addEncodedVectorsToListFromCpu(
+                    listId,
+                    codes,
+                    ids,
+                    numVecs);
+        } else {
+            CpuListCache cache;
+            cache.codes.resize(codesBytes);
+            std::memcpy(cache.codes.data(), codes, codesBytes);
+            if (ids) {
+                cache.ids.assign(ids, ids + numVecs);
+            }
+            cpuListCache_.emplace(listId, std::move(cache));
+        }
+    }
 }
 
 void GpuIndexIVFFlat::copyTo(faiss::IndexIVFFlat* index) const {

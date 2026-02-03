@@ -204,6 +204,13 @@ size_t GpuResources::getTempMemoryAvailableCurrentDevice() const {
     return getTempMemoryAvailable(getCurrentDevice());
 }
 
+bool GpuResources::requestDeviceMemoryReservationResizeCurrentDevice(
+        size_t newSize,
+        bool allowShrink) {
+    return requestDeviceMemoryReservationResize(
+            getCurrentDevice(), newSize, allowShrink);
+}
+
 //
 // GpuResourcesProvider
 //

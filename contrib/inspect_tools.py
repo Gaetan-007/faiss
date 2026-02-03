@@ -7,6 +7,40 @@ import numpy as np
 import faiss
 
 
+def _is_gpu_ivfflat(index):
+    """Return True if index is GpuIndexIVFFlat (from faiss or faiss.swigfaiss)."""
+    if hasattr(faiss, "swigfaiss") and hasattr(faiss.swigfaiss, "GpuIndexIVFFlat"):
+        if isinstance(index, faiss.swigfaiss.GpuIndexIVFFlat):
+            return True
+    if getattr(faiss, "GpuIndexIVFFlat", None) is not None and isinstance(
+        index, faiss.GpuIndexIVFFlat
+    ):
+        return True
+    return False
+
+
+def get_invlist_gpu(index, l):
+    """Return (list_ids, list_codes) for list l from a GpuIndexIVFFlat.
+    list_codes is (ls, code_size) uint8; for IVFFlat this is raw float data
+    so code_size = d * 4.
+    """
+    if not _is_gpu_ivfflat(index):
+        raise TypeError("index is not GpuIndexIVFFlat")
+    ls = index.getListLength(l)
+    if ls == 0:
+        list_ids = np.empty(0, dtype="int64")
+        list_codes = np.empty((0, index.d * 4), dtype="uint8")
+        return list_ids, list_codes
+    # getListIndices / getListVectorData return std::vector; convert to numpy
+    ids_vec = index.getListIndices(l)
+    codes_vec = index.getListVectorData(l, False)
+    list_ids = faiss.vector_to_array(ids_vec).astype("int64")
+    codes_arr = faiss.vector_to_array(codes_vec)
+    code_size = index.d * 4  # float32 per dimension
+    list_codes = codes_arr.reshape(ls, code_size)
+    return list_ids, list_codes
+
+
 def get_invlist(invlists, l):
     """ returns the inverted lists content as a pair of (list_ids, list_codes).
     The codes are reshaped to a proper size

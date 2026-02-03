@@ -83,6 +83,35 @@ TEST(TestGpuMemoryException, AddException) {
     }
 }
 
+TEST(TestGpuMemoryException, PreallocPoolEnforcesLimit) {
+    const size_t reservedBytes = (size_t)32 * 1024 * 1024;
+    const int dims = 128;
+    const size_t numSmallAdd = 10000;
+    const size_t numLargeAdd = 100000;
+
+    faiss::gpu::StandardGpuResources res;
+    res.setTempMemory(0);
+    res.setDeviceMemoryReservation(reservedBytes);
+
+    faiss::gpu::GpuIndexFlatConfig config;
+    config.device = faiss::gpu::randVal(0, faiss::gpu::getNumDevices() - 1);
+    config.use_cuvs = false;
+
+    faiss::gpu::GpuIndexFlatL2 gpuIndexL2(&res, dims, config);
+
+    {
+        auto vecs = faiss::gpu::randVecs(numSmallAdd, dims);
+        EXPECT_NO_THROW(gpuIndexL2.add(numSmallAdd, vecs.data()));
+    }
+
+    EXPECT_DEATH(
+            {
+                auto vecs = faiss::gpu::randVecs(numLargeAdd, dims);
+                gpuIndexL2.add(numLargeAdd, vecs.data());
+            },
+            "preallocated pool exhausted");
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
 

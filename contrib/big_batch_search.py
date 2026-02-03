@@ -17,7 +17,7 @@ import datetime
 import numpy as np
 import faiss
 
-from faiss.contrib.inspect_tools import get_invlist
+from faiss.contrib.inspect_tools import get_invlist, get_invlist_gpu, _is_gpu_ivfflat
 
 
 class BigBatchSearcher:
@@ -123,7 +123,10 @@ class BigBatchSearcher:
             xq_l = xq_l - index.quantizer.reconstruct(l)
         t1 = time.time()
         # prepare database side
-        list_ids, xb_l = get_invlist(index.invlists, l)
+        if _is_gpu_ivfflat(index):
+            list_ids, xb_l = get_invlist_gpu(index, l)
+        else:
+            list_ids, xb_l = get_invlist(index.invlists, l)
 
         if self.decode_func is None:
             xb_l = xb_l.ravel()
@@ -190,6 +193,10 @@ class BlockComputer:
             index_help = faiss.IndexFlat(index.d, index.metric_type)
             decode_func = lambda x: x.view("float32")
             by_residual = False
+        elif _is_gpu_ivfflat(index):
+            index_help = faiss.IndexFlat(index.d, index.metric_type)
+            decode_func = lambda x: x.view("float32")
+            by_residual = False
         elif index.__class__ == faiss.IndexIVFPQ:
             index_help = faiss.IndexPQ(
                 index.d, index.pq.M, index.pq.nbits, index.metric_type)
@@ -252,7 +259,7 @@ def big_batch_search(
     Search queries xq in the IVF index, with a search function that collects
     batches of query vectors per inverted list. This can be faster than the
     regular search indexes.
-    Supports IVFFlat, IVFPQ and IVFScalarQuantizer.
+    Supports IVFFlat, IVFPQ, IVFScalarQuantizer and GpuIndexIVFFlat.
 
     Supports three computation methods:
     method = "index":

@@ -88,6 +88,20 @@ def load_ivf_lists(index, list_ids):
     return _uint64_vector_to_numpy(out)
 
 
+def init_ivf_lists_from_cpu(index, cpu_index, list_ids):
+    """
+    Initialize a GPU IVF-Flat index by loading only selected IVF lists.
+
+    Non-loaded lists with data are cached in CPU memory for on-demand loading.
+    """
+    if not hasattr(index, "copyFromSelective"):
+        raise RuntimeError(
+            "copyFromSelective not available; rebuild Python bindings with GPU support"
+        )
+    v = _to_int64_vector(list_ids)
+    index.copyFromSelective(cpu_index, v)
+
+
 ###########################################
 # Page-fault style auto-fetch management
 # NOTE: (wangzehao) Below functions implement automatic load-on-demand

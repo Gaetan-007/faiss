@@ -71,6 +71,14 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
     /// all data in ourselves
     void copyFrom(const faiss::IndexIVFFlat* index);
 
+    /// NOTE: (wangzehao) This function is used to initialize a GPU IVF-Flat index by loading only selected IVF lists.
+    /// Initialize from a CPU index, but only load selected list IDs to GPU.
+    /// All non-loaded lists (with data) are cached in cpuListCache_ for
+    /// on-demand loading.
+    void copyFromSelective(
+            const faiss::IndexIVFFlat* index,
+            const std::vector<idx_t>& listIds);
+
     /// Copy ourselves to the given CPU index; will overwrite all data
     /// in the index instance
     void copyTo(faiss::IndexIVFFlat* index) const;

@@ -27,7 +27,9 @@
 #include <cuda_runtime.h>
 #include <faiss/impl/FaissAssert.h>
 
+#include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -167,6 +169,15 @@ struct AllocRequest : public AllocInfo {
 #endif
 };
 
+/// Preallocated pool statistics per device
+struct PreallocPoolStats {
+    size_t totalBytes = 0;
+    size_t freeBytes = 0;
+    size_t slabCount = 0;
+    size_t targetBytes = 0;
+    bool shrinkPending = false;
+};
+
 /// A RAII object that manages a temporary memory request
 struct GpuMemoryReservation {
     GpuMemoryReservation();
@@ -251,6 +262,24 @@ class GpuResources {
     /// Returns the stream on which we perform async CPU <-> GPU copies
     virtual cudaStream_t getAsyncCopyStream(int device) = 0;
 
+    /// Request a resize of the device memory reservation pool for a device
+    /// Returns true if resize is accepted (may be pending for shrink)
+    virtual bool requestDeviceMemoryReservationResize(
+            int device,
+            size_t newSize,
+            bool allowShrink) = 0;
+
+    /// Attach to a shared memory IPC command queue for pool resize
+    virtual void setPreallocPoolIpc(
+            const std::string& name,
+            size_t capacity) = 0;
+
+    /// Poll IPC queue and apply resize commands; returns processed count
+    virtual size_t pollPreallocPoolIpc() = 0;
+
+    /// Return prealloc pool stats for all devices
+    virtual std::map<int, PreallocPoolStats> getPreallocPoolStats() const = 0;
+
     ///
     /// Functions provided by default
     ///
@@ -283,6 +312,11 @@ class GpuResources {
 
     /// Calls getAsyncCopyStream for the current device
     cudaStream_t getAsyncCopyStreamCurrentDevice();
+
+    /// Calls requestDeviceMemoryReservationResize for the current device
+    bool requestDeviceMemoryReservationResizeCurrentDevice(
+            size_t newSize,
+            bool allowShrink);
 };
 
 /// Interface for a provider of a shared resources object. This is to avoid
