@@ -39,12 +39,14 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <sys/mman.h>
 #include <thread>
@@ -105,6 +107,25 @@ constexpr size_t kDefaultMinChunkSize = (size_t)256 * 1024 * 1024;
 // IPC polling interval in milliseconds
 constexpr int kIPCPollIntervalMs = 10;
 
+// Async expansion check interval in milliseconds
+constexpr int kAsyncExpandCheckIntervalMs = 5;
+
+/// Request for async expansion
+struct AsyncExpandRequest {
+    size_t targetSize;
+    uint64_t requestId;
+    std::chrono::steady_clock::time_point timestamp;
+};
+
+/// Status of async expansion
+enum class AsyncExpandStatus {
+    Idle,        // No expansion in progress
+    Pending,     // Expansion requested, waiting to start
+    InProgress,  // Expansion is currently being processed
+    Completed,   // Expansion completed successfully
+    Failed       // Expansion failed
+};
+
 /// A single memory chunk within the preallocated pool.
 struct MemoryChunk {
     void* base;      // Base address of this chunk
@@ -131,6 +152,7 @@ struct MemoryChunk {
 
 // NOTE:(wangzehao) PreallocMemoryPool is a class that manages a pool of memory
 // with support for online elastic scaling via shared memory IPC.
+// Supports async expansion that runs in background without blocking user requests.
 class PreallocMemoryPool {
    public:
     PreallocMemoryPool(int device, size_t initialSize, bool enableIPC = true)
@@ -140,7 +162,10 @@ class PreallocMemoryPool {
               nextChunkId_(0),
               shmFd_(-1),
               shmPtr_(nullptr),
-              stopPolling_(false) {
+              stopPolling_(false),
+              nextAsyncRequestId_(0),
+              asyncExpandStatus_(AsyncExpandStatus::Idle),
+              stopAsyncExpand_(false) {
         // Allocate initial chunk if size > 0
         if (initialSize > 0) {
             size_t alignedSize = utils::roundUp(initialSize, (size_t)256);
@@ -173,10 +198,16 @@ class PreallocMemoryPool {
             initSharedMemory();
             startPollingThread();
         }
+
+        // Start async expansion thread
+        startAsyncExpandThread();
     }
 
     ~PreallocMemoryPool() {
-        // Stop the polling thread first
+        // Stop async expansion thread first
+        stopAsyncExpandThread();
+
+        // Stop the polling thread
         stopPollingThread();
 
         // Clean up shared memory
@@ -244,6 +275,41 @@ class PreallocMemoryPool {
     ResizeResult query() {
         std::lock_guard<std::mutex> lock(mutex_);
         return {ResizeStatus::Success, totalSize_, getSizeAvailableLocked(), ""};
+    }
+
+    /// Submit an async expansion request (non-blocking)
+    /// Returns a request ID that can be used to query the status
+    uint64_t expandAsync(size_t targetSize) {
+        std::lock_guard<std::mutex> lock(asyncMutex_);
+        
+        uint64_t requestId = nextAsyncRequestId_++;
+        AsyncExpandRequest req;
+        req.targetSize = targetSize;
+        req.requestId = requestId;
+        req.timestamp = std::chrono::steady_clock::now();
+        
+        asyncExpandQueue_.push(req);
+        asyncExpandCv_.notify_one();
+        
+        return requestId;
+    }
+
+    /// Query the status of async expansion
+    AsyncExpandStatus getAsyncExpandStatus() const {
+        return asyncExpandStatus_.load(std::memory_order_acquire);
+    }
+
+    /// Get the last async expansion result (thread-safe)
+    ResizeResult getLastAsyncExpandResult() const {
+        std::lock_guard<std::mutex> lock(asyncMutex_);
+        return lastAsyncExpandResult_;
+    }
+
+    /// Check if there's a pending async expansion
+    bool hasAsyncExpandPending() const {
+        std::lock_guard<std::mutex> lock(asyncMutex_);
+        return !asyncExpandQueue_.empty() || 
+               asyncExpandStatus_.load(std::memory_order_acquire) == AsyncExpandStatus::InProgress;
     }
 
    private:
@@ -392,6 +458,58 @@ class PreallocMemoryPool {
         totalSize_ += delta;
 
         return {ResizeStatus::Success, totalSize_, getSizeAvailableLocked(), ""};
+    }
+
+    /// Perform expansion without holding the main mutex during cudaMalloc.
+    /// This allows allocations to continue from existing chunks during expansion.
+    ResizeResult expandNonBlocking(size_t targetSize) {
+        // Phase 1: Check if expansion is needed and calculate delta (with lock)
+        size_t delta = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (targetSize <= totalSize_) {
+                return {ResizeStatus::Success,
+                        totalSize_,
+                        getSizeAvailableLocked(),
+                        ""};
+            }
+            delta = targetSize - totalSize_;
+            delta = utils::roundUp(delta, minChunkSize_);
+        }
+
+        // Phase 2: Allocate memory WITHOUT holding the lock
+        // This is the slow operation that we don't want to block other threads
+        DeviceScope scope(device_);
+        void* newBase = nullptr;
+        auto err = cudaMalloc(&newBase, delta);
+
+        if (err != cudaSuccess) {
+            cudaGetLastError(); // Clear error
+            std::lock_guard<std::mutex> lock(mutex_);
+            return {ResizeStatus::Failed,
+                    totalSize_,
+                    getSizeAvailableLocked(),
+                    std::string("cudaMalloc failed: ") + cudaGetErrorString(err)};
+        }
+
+        // Phase 3: Add new chunk to pool (with lock)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            
+            // Double-check: another thread may have expanded while we were allocating
+            // In that case, we still add our chunk (more memory doesn't hurt)
+            auto chunk = std::make_unique<MemoryChunk>();
+            chunk->base = newBase;
+            chunk->size = delta;
+            chunk->usedBytes = 0;
+            chunk->chunkId = nextChunkId_++;
+            chunk->freeBlocks.emplace(static_cast<char*>(newBase), delta);
+
+            chunks_.push_back(std::move(chunk));
+            totalSize_ += delta;
+
+            return {ResizeStatus::Success, totalSize_, getSizeAvailableLocked(), ""};
+        }
     }
 
     ResizeResult shrinkLocked(size_t targetSize) {
@@ -571,18 +689,50 @@ class PreallocMemoryPool {
         ResizeResult result;
 
         switch (cmd) {
-            case ResizeCommand::ExpandTo:
-                result = expand(static_cast<size_t>(ctrl->targetSizeBytes));
+            case ResizeCommand::ExpandTo: {
+                // Use async expansion for expand commands
+                size_t targetSize = static_cast<size_t>(ctrl->targetSizeBytes);
+                size_t currentSize = getTotalSize();
+                
+                if (targetSize > currentSize) {
+                    // Submit async expand request
+                    expandAsync(targetSize);
+                    
+                    // Return immediately with pending status
+                    result.status = ResizeStatus::Pending;
+                    result.actualSize = currentSize;
+                    result.availableSize = getSizeAvailable();
+                    result.errorMsg = "Async expansion submitted";
+                } else {
+                    // No expansion needed
+                    result = query();
+                }
                 break;
+            }
             case ResizeCommand::ShrinkTo:
                 result = shrink(static_cast<size_t>(ctrl->targetSizeBytes));
                 break;
-            case ResizeCommand::Query:
+            case ResizeCommand::Query: {
                 result = query();
+                // Also include async expand status in the response
+                auto asyncStatus = getAsyncExpandStatus();
+                if (asyncStatus == AsyncExpandStatus::InProgress ||
+                    asyncStatus == AsyncExpandStatus::Pending) {
+                    result.errorMsg = "Async expansion in progress";
+                }
                 break;
+            }
             case ResizeCommand::ExpandBy: {
-                std::lock_guard<std::mutex> lock(mutex_);
-                result = expandLocked(totalSize_ + static_cast<size_t>(ctrl->deltaBytes));
+                // Use async expansion for expand-by commands
+                size_t currentSize = getTotalSize();
+                size_t targetSize = currentSize + static_cast<size_t>(ctrl->deltaBytes);
+                
+                expandAsync(targetSize);
+                
+                result.status = ResizeStatus::Pending;
+                result.actualSize = currentSize;
+                result.availableSize = getSizeAvailable();
+                result.errorMsg = "Async expansion submitted";
                 break;
             }
             case ResizeCommand::Nop:
@@ -603,6 +753,87 @@ class PreallocMemoryPool {
         ctrl->command = static_cast<uint32_t>(ResizeCommand::Nop);
     }
 
+    void startAsyncExpandThread() {
+        stopAsyncExpand_.store(false, std::memory_order_release);
+        asyncExpandThread_ = std::thread([this]() { asyncExpandLoop(); });
+    }
+
+    void stopAsyncExpandThread() {
+        stopAsyncExpand_.store(true, std::memory_order_release);
+        asyncExpandCv_.notify_all();
+        if (asyncExpandThread_.joinable()) {
+            asyncExpandThread_.join();
+        }
+    }
+
+    void asyncExpandLoop() {
+        while (!stopAsyncExpand_.load(std::memory_order_acquire)) {
+            AsyncExpandRequest req;
+            bool hasRequest = false;
+            
+            {
+                std::unique_lock<std::mutex> lock(asyncMutex_);
+                
+                // Wait for a request or stop signal
+                asyncExpandCv_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(kAsyncExpandCheckIntervalMs),
+                    [this]() {
+                        return !asyncExpandQueue_.empty() || 
+                               stopAsyncExpand_.load(std::memory_order_acquire);
+                    });
+                
+                if (stopAsyncExpand_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                
+                if (!asyncExpandQueue_.empty()) {
+                    req = asyncExpandQueue_.front();
+                    asyncExpandQueue_.pop();
+                    hasRequest = true;
+                    asyncExpandStatus_.store(AsyncExpandStatus::InProgress, std::memory_order_release);
+                }
+            }
+            
+            if (hasRequest) {
+                // Perform the expansion using non-blocking method
+                // This doesn't hold mutex_ during cudaMalloc, allowing other
+                // allocations to continue using existing pool memory
+                ResizeResult result = expandNonBlocking(req.targetSize);
+                
+                // Update status and result
+                {
+                    std::lock_guard<std::mutex> lock(asyncMutex_);
+                    lastAsyncExpandResult_ = result;
+                    
+                    if (result.isSuccess()) {
+                        asyncExpandStatus_.store(AsyncExpandStatus::Completed, std::memory_order_release);
+                    } else {
+                        asyncExpandStatus_.store(AsyncExpandStatus::Failed, std::memory_order_release);
+                    }
+                }
+                
+                // Update shared memory status if available
+                if (shmPtr_) {
+                    auto* ctrl = static_cast<ShmControlBlock*>(shmPtr_);
+                    ctrl->actualSizeBytes = static_cast<int64_t>(result.actualSize);
+                    ctrl->availableBytes = static_cast<int64_t>(result.availableSize);
+                    ctrl->status = static_cast<uint32_t>(result.status);
+                    std::atomic_thread_fence(std::memory_order_release);
+                }
+                
+                // Reset to idle after a short delay if no more requests
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                {
+                    std::lock_guard<std::mutex> lock(asyncMutex_);
+                    if (asyncExpandQueue_.empty()) {
+                        asyncExpandStatus_.store(AsyncExpandStatus::Idle, std::memory_order_release);
+                    }
+                }
+            }
+        }
+    }
+
    private:
     int device_;
     mutable std::mutex mutex_;
@@ -616,6 +847,16 @@ class PreallocMemoryPool {
     void* shmPtr_;
     std::atomic<bool> stopPolling_;
     std::thread pollingThread_;
+
+    // Async expansion support
+    mutable std::mutex asyncMutex_;
+    std::condition_variable asyncExpandCv_;
+    std::queue<AsyncExpandRequest> asyncExpandQueue_;
+    std::thread asyncExpandThread_;
+    std::atomic<bool> stopAsyncExpand_;
+    uint64_t nextAsyncRequestId_;
+    std::atomic<AsyncExpandStatus> asyncExpandStatus_;
+    ResizeResult lastAsyncExpandResult_;
 };
 
 //

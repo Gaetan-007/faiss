@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES=7
 python benchs/bench_gpu_pool_resize.py \
     --nb 500000 \
     --dim 1024 \
-    --base-pool-mb 2048 \
+    --base-pool-mb 8192 \
     --batch-sizes "100,500,1000,2000,5000" \
     --delta-sizes-mb "32,64,128,256,512" \
     --nruns 10 \
