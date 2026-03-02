@@ -141,6 +141,7 @@ set(FAISS_HEADERS
   IndexIVFIndependentQuantizer.h
   IndexIVFFlat.h
   IndexIVFFlatPanorama.h
+  IVFEvictLoadInterface.h
   IndexIVFPQ.h
   IndexIVFFastScan.h
   IndexIVFAdditiveQuantizerFastScan.h

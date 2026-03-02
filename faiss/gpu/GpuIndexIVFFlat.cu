@@ -123,6 +123,8 @@ void GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
 
     // Clear out our old data
     index_.reset();
+    cpuListCache_.clear();
+    externalIndex_ = nullptr;
 
     // skip base class allocations if cuVS is enabled
     if (!should_use_cuvs(config_)) {
@@ -163,6 +165,9 @@ void GpuIndexIVFFlat::copyFromSelective(
     DeviceScope scope(config_.device);
 
     FAISS_THROW_IF_NOT_MSG(index, "copyFromSelective: index must not be null");
+
+    // Record external CPU backing index for later no-copy eviction and loads.
+    externalIndex_ = index;
 
     // This will copy GpuIndexIVF data such as the coarse quantizer
     GpuIndexIVF::copyFrom(index);
@@ -228,8 +233,6 @@ void GpuIndexIVFFlat::copyFromSelective(
         const auto* codes =
                 reinterpret_cast<const uint8_t*>(invlists->get_codes(listId));
         const auto* ids = invlists->get_ids(listId);
-        const size_t codesBytes =
-                static_cast<size_t>(numVecs) * index->code_size;
 
         FAISS_THROW_IF_NOT_MSG(
                 codes,
@@ -248,11 +251,10 @@ void GpuIndexIVFFlat::copyFromSelective(
                     numVecs);
         } else {
             CpuListCache cache;
-            cache.codes.resize(codesBytes);
-            std::memcpy(cache.codes.data(), codes, codesBytes);
-            if (ids) {
-                cache.ids.assign(ids, ids + numVecs);
-            }
+            cache.backingType = CpuCacheBackingType::ExternalInvlists;
+            cache.state = CpuCacheState::Clean;
+            cache.externalIndex = index;
+            cache.externalListId = listId;
             cpuListCache_.emplace(listId, std::move(cache));
         }
     }
@@ -321,15 +323,73 @@ size_t GpuIndexIVFFlat::evictCentroidToCpu(idx_t listId) {
             listId,
             nlist);
 
-    if (cpuListCache_.count(listId)) {
+    auto it = cpuListCache_.find(listId);
+    if (it != cpuListCache_.end()) {
+        // Already known to be backed by CPU (either internal copy or external);
+        // nothing to do.
         return 0;
     }
 
+    // If no-copy eviction is enabled and we have an external CPU backing
+    // index, avoid issuing a GPU->CPU copy and rely on that backing instead.
+    if (allowNoCopyEvict_) {
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::evictCentroidToCpu: no external backing "
+                "IndexIVFFlat configured for no-copy eviction");
+
+        auto* invlists = externalIndex_->invlists;
+        FAISS_THROW_IF_NOT_MSG(
+                invlists,
+                "GpuIndexIVFFlat::evictCentroidToCpu: external backing index "
+                "has no invlists");
+
+        FAISS_THROW_IF_NOT_FMT(
+                listId >= 0 && listId < invlists->nlist,
+                "GpuIndexIVFFlat::evictCentroidToCpu: external list %ld out "
+                "of bounds (%ld lists total)",
+                listId,
+                invlists->nlist);
+
+        // Optionally validate list lengths when possible.
+        if (baseIndex_) {
+            auto cpuLen = invlists->list_size(listId);
+            auto gpuLen = baseIndex_->getListLength(listId);
+            FAISS_THROW_IF_NOT_FMT(
+                    cpuLen == gpuLen,
+                    "GpuIndexIVFFlat::evictCentroidToCpu: external list %ld "
+                    "length mismatch (CPU %ld, GPU %ld)",
+                    listId,
+                    cpuLen,
+                    gpuLen);
+        }
+
+        CpuListCache cache;
+        cache.backingType = CpuCacheBackingType::ExternalInvlists;
+        cache.state = CpuCacheState::Clean;
+        cache.externalIndex = externalIndex_;
+        cache.externalListId = listId;
+        cpuListCache_.emplace(listId, std::move(cache));
+
+        // Ensure any pending operations on the IVF lists complete before
+        // we reclaim device memory.
+        resources_->syncDefaultStream(config_.device);
+        return index_->evictList(listId);
+    }
+
+    // Fallback: perform a defensive GPU->CPU copy into an internal cache
+    // entry before evicting.
     CpuListCache cache;
+    cache.backingType = CpuCacheBackingType::InternalCopy;
+    cache.state = CpuCacheState::Clean;
     cache.codes = index_->getListVectorData(listId, false);
     cache.ids = index_->getListIndices(listId);
-
     cpuListCache_.emplace(listId, std::move(cache));
+
+    // Sync before evictList: copyToHost uses cudaMemcpyAsync; we must ensure
+    // the copy completes before freeing device memory (prevents use-after-free
+    // and pool corruption when setDeviceMemoryReservation is used).
+    resources_->syncDefaultStream(config_.device);
 
     return index_->evictList(listId);
 }
@@ -351,21 +411,79 @@ size_t GpuIndexIVFFlat::loadCentroidToGpu(idx_t listId) {
     }
 
     auto& cache = it->second;
-    auto numVecs = (idx_t)cache.ids.size();
+    size_t bytesLoaded = 0;
 
-    if (ivfFlatConfig_.indicesOptions != INDICES_IVF) {
+    if (cache.backingType == CpuCacheBackingType::InternalCopy) {
+        auto numVecs = (idx_t)cache.ids.size();
+        if (numVecs == 0 && !cache.codes.empty()) {
+            numVecs = (idx_t)(cache.codes.size() / (this->d * sizeof(float)));
+        }
+
+        if (ivfFlatConfig_.indicesOptions != INDICES_IVF && numVecs > 0) {
+            FAISS_THROW_IF_NOT_MSG(
+                    !cache.ids.empty(),
+                    "Cached IVF list is missing indices for GPU load");
+        }
+
+        index_->addEncodedVectorsToListFromCpu(
+                listId,
+                cache.codes.data(),
+                cache.ids.empty() ? nullptr : cache.ids.data(),
+                numVecs);
+
+        bytesLoaded =
+                cache.codes.size() + cache.ids.size() * sizeof(idx_t);
+    } else if (cache.backingType == CpuCacheBackingType::ExternalInvlists) {
         FAISS_THROW_IF_NOT_MSG(
-                !cache.ids.empty(),
-                "Cached IVF list is missing indices for GPU load");
+                cache.externalIndex,
+                "loadCentroidToGpu: external-backed cache entry has no "
+                "source IndexIVFFlat");
+
+        auto* invlists = cache.externalIndex->invlists;
+        FAISS_THROW_IF_NOT_MSG(
+                invlists,
+                "loadCentroidToGpu: external backing index has no invlists");
+
+        FAISS_THROW_IF_NOT_FMT(
+                cache.externalListId >= 0 &&
+                        cache.externalListId < invlists->nlist,
+                "loadCentroidToGpu: external list %ld out of bounds (%ld "
+                "lists total)",
+                cache.externalListId,
+                invlists->nlist);
+
+        auto numVecs = invlists->list_size(cache.externalListId);
+        if (numVecs == 0) {
+            cpuListCache_.erase(it);
+            return 0;
+        }
+
+        const auto* codes = reinterpret_cast<const uint8_t*>(
+                invlists->get_codes(cache.externalListId));
+        const auto* ids = invlists->get_ids(cache.externalListId);
+
+        FAISS_THROW_IF_NOT_MSG(
+                codes,
+                "loadCentroidToGpu: external-backed IVF list has null codes");
+        if (ivfFlatConfig_.indicesOptions != INDICES_IVF && numVecs > 0) {
+            FAISS_THROW_IF_NOT_MSG(
+                    ids,
+                    "loadCentroidToGpu: external-backed IVF list is missing "
+                    "indices");
+        }
+
+        index_->addEncodedVectorsToListFromCpu(listId, codes, ids, numVecs);
+
+        bytesLoaded = static_cast<size_t>(numVecs) *
+                static_cast<size_t>(cache.externalIndex->code_size);
+        if (ids) {
+            bytesLoaded += static_cast<size_t>(numVecs) * sizeof(idx_t);
+        }
+    } else {
+        FAISS_THROW_MSG(
+                "loadCentroidToGpu: unknown CpuCacheBackingType for IVF list");
     }
 
-    index_->addEncodedVectorsToListFromCpu(
-            listId,
-            cache.codes.data(),
-            cache.ids.empty() ? nullptr : cache.ids.data(),
-            numVecs);
-
-    size_t bytesLoaded = cache.codes.size() + cache.ids.size() * sizeof(idx_t);
     cpuListCache_.erase(it);
 
     return bytesLoaded;
@@ -469,6 +587,22 @@ void GpuIndexIVFFlat::setAutoFetch(bool enable) {
 
 bool GpuIndexIVFFlat::isAutoFetchEnabled() const {
     return autoFetchEnabled_;
+}
+
+void GpuIndexIVFFlat::setNoCopyEvictEnabled(bool enable) {
+    if (enable) {
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::setNoCopyEvictEnabled: no external "
+                "IndexIVFFlat backing configured; build this index with "
+                "copyFromSelective or provide an external backing index "
+                "before enabling no-copy eviction");
+    }
+    allowNoCopyEvict_ = enable;
+}
+
+bool GpuIndexIVFFlat::isNoCopyEvictEnabled() const {
+    return allowNoCopyEvict_;
 }
 
 bool GpuIndexIVFFlat::isListOnGpu(idx_t listId) const {
@@ -590,6 +724,20 @@ void GpuIndexIVFFlat::searchImpl_(
 
     // Now perform the actual search
     GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+}
+
+void GpuIndexIVFFlat::addImpl_(idx_t n, const float* x, const idx_t* ids) {
+    // When no-copy eviction with external CPU backing is enabled, we require
+    // the IVF lists to remain consistent with the external source. For now,
+    // enforce a read-only policy in this mode to avoid silent divergence.
+    if (allowNoCopyEvict_ && externalIndex_) {
+        FAISS_THROW_MSG(
+                "GpuIndexIVFFlat::addImpl_: adding vectors is not allowed "
+                "while no-copy eviction with external CPU backing is "
+                "enabled; build a new GPU index or disable no-copy eviction");
+    }
+
+    GpuIndexIVF::addImpl_(n, x, ids);
 }
 
 void GpuIndexIVFFlat::train(idx_t n, const float* x) {

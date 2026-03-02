@@ -180,6 +180,29 @@ size_t InvertedLists::copy_subset_to(
     return n_added;
 }
 
+size_t InvertedLists::copy_lists_to(
+        InvertedLists& oivf,
+        const std::vector<idx_t>& list_ids) const {
+    FAISS_THROW_IF_NOT(nlist == oivf.nlist);
+    FAISS_THROW_IF_NOT(code_size == oivf.code_size);
+    size_t n_added = 0;
+    for (idx_t list_no : list_ids) {
+        if (list_no >= nlist) {
+            continue;
+        }
+        size_t n = list_size(list_no);
+        if (n > 0) {
+            oivf.add_entries(
+                    list_no,
+                    n,
+                    ScopedIds(this, list_no).get(),
+                    ScopedCodes(this, list_no).get());
+            n_added += n;
+        }
+    }
+    return n_added;
+}
+
 double InvertedLists::imbalance_factor() const {
     std::vector<int64_t> hist(nlist);
 

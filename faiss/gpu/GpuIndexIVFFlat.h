@@ -8,6 +8,7 @@
 #pragma once
 
 #include <faiss/gpu/GpuIndexIVF.h>
+#include <faiss/IVFEvictLoadInterface.h>
 #include <faiss/impl/ScalarQuantizer.h>
 
 #include <atomic>
@@ -34,7 +35,7 @@ struct GpuIndexIVFFlatConfig : public GpuIndexIVFConfig {
 
 /// Wrapper around the GPU implementation that looks like
 /// faiss::IndexIVFFlat
-class GpuIndexIVFFlat : public GpuIndexIVF {
+class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
    public:
     /// Construct from a pre-existing faiss::IndexIVFFlat instance, copying
     /// data over to the given GPU, if the input index is trained.
@@ -103,21 +104,21 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
 
     /// NOTE: (wangzehao) This function is used to evict a single IVF list (centroid) to CPU memory and free GPU memory
     /// Evict a single IVF list (centroid) to CPU memory and free GPU memory
-    size_t evictCentroidToCpu(idx_t listId);
+    size_t evictCentroidToCpu(idx_t listId) override;
 
     /// NOTE: (wangzehao) This function is used to load a single IVF list (centroid) from CPU memory back to GPU
     /// Load a single IVF list (centroid) from CPU memory back to GPU
-    size_t loadCentroidToGpu(idx_t listId);
+    size_t loadCentroidToGpu(idx_t listId) override;
 
     /// NOTE: (wangzehao) This function is used to evict multiple IVF lists (centroids) to CPU memory and free GPU memory
     /// Evict multiple IVF lists (centroids); returns reclaimed bytes per list
     std::vector<uint64_t> evictCentroidsToCpu(
-            const std::vector<idx_t>& listIds);
+            const std::vector<idx_t>& listIds) override;
 
     /// NOTE: (wangzehao) This function is used to load multiple IVF lists (centroids) from CPU memory back to GPU
     /// Load multiple IVF lists (centroids); returns loaded bytes per list
     std::vector<uint64_t> loadCentroidsToGpu(
-            const std::vector<idx_t>& listIds);
+            const std::vector<idx_t>& listIds) override;
 
     /// NOTE: (wangzehao) This function is used to process a shared-memory IPC command; returns true if one was handled
     /// Process a shared-memory IPC command; returns true if one was handled
@@ -137,11 +138,21 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
     /// Check if auto-fetch is currently enabled
     bool isAutoFetchEnabled() const;
 
+    /// Enable or disable no-copy eviction for lists that have valid CPU
+    /// backing metadata. When enabled, such lists can be evicted without
+    /// issuing a GPU->CPU copy; eviction will rely on external CPU backing
+    /// recorded in CpuListCache. This mode assumes the external backing
+    /// remains valid for the lifetime of this GPU index.
+    void setNoCopyEvictEnabled(bool enable);
+
+    /// Returns whether no-copy eviction is currently enabled.
+    bool isNoCopyEvictEnabled() const;
+
     /// Check if a single IVF list (centroid) is currently on GPU
-    bool isListOnGpu(idx_t listId) const;
+    bool isListOnGpu(idx_t listId) const override;
 
     /// Get the set of lists that are currently evicted (in CPU cache)
-    std::vector<idx_t> getEvictedLists() const;
+    std::vector<idx_t> getEvictedLists() const override;
 
     /// Get statistics about auto-fetch operations (for debugging/profiling)
     struct AutoFetchStats {
@@ -168,6 +179,10 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
             idx_t* labels,
             const SearchParameters* params) const override;
 
+    /// Override addImpl_ to enforce external-backing invariants when
+    /// no-copy eviction is enabled.
+    void addImpl_(idx_t n, const float* x, const idx_t* ids) override;
+
    protected:
     /// Initialize appropriate index
     void setIndex_(
@@ -193,9 +208,39 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
     /// Instance that we own; contains the inverted lists
     std::shared_ptr<IVFFlat> index_;
 
+    /// Optional CPU IndexIVFFlat that serves as an external backing store
+    /// for IVF lists when using copyFromSelective and no-copy eviction.
+    /// This pointer is non-owning; the caller must ensure the CPU index
+    /// outlives this GPU index if external backing is used.
+    const faiss::IndexIVFFlat* externalIndex_ = nullptr;
+
    /// NOTE: (wangzehao) This struct is used to cache the CPU-encoded data and indices of a single IVF list
    private:
+    enum class CpuCacheBackingType : uint8_t {
+        /// Cache owns an internal copy of codes/ids bytes
+        InternalCopy = 0,
+        /// Cache entry describes external CPU storage (e.g., a CPU IndexIVFFlat)
+        ExternalInvlists = 1
+    };
+
+    enum class CpuCacheState : uint8_t {
+        /// GPU data and CPU backing are known to be identical
+        Clean = 0,
+        /// GPU data may be newer than CPU backing; no-copy eviction is unsafe
+        Dirty = 1
+    };
+
     struct CpuListCache {
+        CpuCacheBackingType backingType = CpuCacheBackingType::InternalCopy;
+        CpuCacheState state = CpuCacheState::Clean;
+
+        // When backingType == ExternalInvlists, externalIndex + externalListId
+        // describe where the CPU data lives. The external index must outlive
+        // this GPU index; otherwise behavior is undefined.
+        const faiss::IndexIVFFlat* externalIndex = nullptr;
+        idx_t externalListId = -1;
+
+        // When backingType == InternalCopy, codes/ids own the cached bytes.
         std::vector<uint8_t> codes;
         std::vector<idx_t> ids;
     };
@@ -205,6 +250,10 @@ class GpuIndexIVFFlat : public GpuIndexIVF {
     /// NOTE: (wangzehao) Auto-fetch (page-fault style) management members
     /// When true, search will automatically fetch missing lists from CPU
     bool autoFetchEnabled_ = false;
+
+    /// When true, lists that have valid external CPU backing and are marked
+    /// clean may be evicted without issuing a GPU->CPU copy.
+    bool allowNoCopyEvict_ = false;
 
     /// Statistics for auto-fetch operations
     mutable AutoFetchStats autoFetchStats_ = {0, 0, 0};

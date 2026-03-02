@@ -429,6 +429,13 @@ struct IndexIVF : Index, IndexIVFInterface {
             idx_t a1,
             idx_t a2) const;
 
+    /** copy only the specified inverted lists to the other index
+     * @param list_ids list IDs to copy (may be non-contiguous)
+     */
+    virtual void copy_lists_to(
+            IndexIVF& other,
+            const std::vector<idx_t>& list_ids) const;
+
     ~IndexIVF() override;
 
     size_t get_list_size(size_t list_no) const {

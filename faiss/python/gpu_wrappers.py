@@ -142,6 +142,41 @@ def is_auto_fetch_enabled(index):
     return index.isAutoFetchEnabled()
 
 
+def set_no_copy_evict(index, enable):
+    """
+    Enable or disable no-copy eviction for IVF lists that have valid
+    external CPU backing. When enabled, eligible lists can be evicted
+    without issuing a GPU->CPU copy; eviction will rely on metadata
+    recorded inside the GpuIndexIVFFlat instance (for example when
+    constructed via copyFromSelective).
+
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+    enable : bool
+        True to enable no-copy eviction, False to disable
+    """
+    index.setNoCopyEvictEnabled(bool(enable))
+
+
+def is_no_copy_evict_enabled(index):
+    """
+    Check if no-copy eviction is currently enabled.
+
+    Parameters
+    ----------
+    index : GpuIndexIVFFlat
+        The GPU IVF Flat index
+
+    Returns
+    -------
+    bool
+        True if no-copy eviction is enabled
+    """
+    return index.isNoCopyEvictEnabled()
+
+
 def is_list_on_gpu(index, list_id):
     """
     Check if a single IVF list (centroid) is currently on GPU.

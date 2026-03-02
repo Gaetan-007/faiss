@@ -165,6 +165,14 @@ struct InvertedLists {
             idx_t a1,
             idx_t a2) const;
 
+    /** copy only the specified inverted lists to the other index
+     * @param list_ids list IDs to copy (may be non-contiguous)
+     * @return number of entries copied
+     */
+    size_t copy_lists_to(
+            InvertedLists& other,
+            const std::vector<idx_t>& list_ids) const;
+
     /*************************
      * statistics            */
 

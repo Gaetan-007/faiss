@@ -60,6 +60,12 @@ struct ToGpuClonerMultiple : faiss::Cloner, GpuMultipleClonerOptions {
             idx_t n,
             idx_t i);
 
+    /// Overload for shard_type=5: copy by explicit list IDs (load-balanced)
+    void copy_ivf_shard(
+            const IndexIVF* index_ivf,
+            IndexIVF* idx2,
+            const std::vector<idx_t>& list_ids);
+
     Index* clone_Index_to_shards(const Index* index);
 
     /// main function

@@ -1545,10 +1545,13 @@ void StandardGpuResourcesImpl::deallocMemory(int device, void* p) {
             FAISS_ASSERT(poolIt != preallocPools_.end());
             auto* pool = poolIt->second.get();
             FAISS_ASSERT(pool);
-            FAISS_ASSERT_FMT(
-                    pool->owns(p),
-                    "Pointer does not belong to preallocated pool on device %d",
-                    device);
+            if (!pool->owns(p)) {
+                FAISS_THROW_FMT(
+                        "Pointer %p does not belong to preallocated pool on device %d"
+                        " (evict may have freed memory still in use)",
+                        p,
+                        device);
+            }
             pool->deallocate(p, req.size);
         } else {
 #if defined USE_NVIDIA_CUVS
