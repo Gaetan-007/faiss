@@ -91,3 +91,99 @@ def test_load_and_auto_fetch_after_selective_init():
 
     evicted_after = set(faiss.get_evicted_lists(gpu_index).tolist())
     assert len(evicted_after) == 0
+
+
+def test_set_no_copy_evict_requires_backing():
+    """set_no_copy_evict should fail if no external CPU backing is configured."""
+    _skip_if_no_gpu()
+
+    d = 16
+    nlist = 10
+    res = faiss.StandardGpuResources()
+    gpu_index = faiss.GpuIndexIVFFlat(res, d, nlist, faiss.METRIC_L2)
+
+    with pytest.raises(Exception):
+        faiss.set_no_copy_evict(gpu_index, True)
+
+
+def test_no_copy_evict_with_external_backing():
+    """No-copy eviction works when the GPU index has external CPU backing."""
+    _skip_if_no_gpu()
+    cpu_index, _ = _build_cpu_ivfflat()
+    nonempty = _get_nonempty_lists(cpu_index)
+    if len(nonempty) == 0:
+        pytest.skip("Need at least one non-empty IVF list")
+
+    load_ids = nonempty[:1]
+
+    res = faiss.StandardGpuResources()
+    gpu_index = faiss.GpuIndexIVFFlat(
+        res, cpu_index.d, cpu_index.nlist, cpu_index.metric_type
+    )
+    faiss.init_ivf_lists_from_cpu(gpu_index, cpu_index, load_ids)
+
+    # Enable no-copy eviction now that we have a CPU backing index.
+    faiss.set_no_copy_evict(gpu_index, True)
+    list_id = int(load_ids[0])
+    assert faiss.is_list_on_gpu(gpu_index, list_id)
+
+    # Evict using the helper; this should route to the no-copy path and
+    # rely on external CPU backing instead of a GPU->CPU copy.
+    reclaimed = faiss.evict_ivf_lists(gpu_index, [list_id])
+    assert reclaimed.shape[0] == 1
+    assert not faiss.is_list_on_gpu(gpu_index, list_id)
+
+    evicted = set(faiss.get_evicted_lists(gpu_index).tolist())
+    assert list_id in evicted
+
+    # Load the list back from CPU backing and ensure it is resident again.
+    loaded = faiss.load_ivf_lists(gpu_index, [list_id])
+    assert loaded.shape[0] == 1
+    assert faiss.is_list_on_gpu(gpu_index, list_id)
+
+
+def test_no_copy_evict_search_correctness():
+    """
+    No-copy eviction preserves search correctness when using a CPU-backed IVF
+    index and auto-fetch.
+    """
+    _skip_if_no_gpu()
+    cpu_index, xb = _build_cpu_ivfflat(seed=789)
+    nonempty = _get_nonempty_lists(cpu_index)
+    if len(nonempty) < 2:
+        pytest.skip("Need at least two non-empty IVF lists")
+
+    # Use half of the non-empty lists as initially loaded on GPU
+    load_ids = nonempty[: max(1, len(nonempty) // 2)]
+    res = faiss.StandardGpuResources()
+    gpu_index = faiss.GpuIndexIVFFlat(
+        res, cpu_index.d, cpu_index.nlist, cpu_index.metric_type
+    )
+
+    # Initialize GPU index with a subset of IVF lists; the remaining lists
+    # are backed only by the CPU IndexIVFFlat.
+    faiss.init_ivf_lists_from_cpu(gpu_index, cpu_index, load_ids)
+
+    # Enable auto-fetch and no-copy eviction. Auto-fetch will load any
+    # evicted/CPU-backed lists that are needed by a search.
+    faiss.set_auto_fetch(gpu_index, True)
+    faiss.set_no_copy_evict(gpu_index, True)
+
+    # Use a relatively large nprobe to ensure that most lists are visited.
+    k = 5
+    xq = xb[:20]
+    cpu_index.nprobe = cpu_index.nlist
+    gpu_index.nprobe = cpu_index.nlist
+
+    # CPU reference result
+    D_cpu, I_cpu = cpu_index.search(xq, k)
+
+    # Evict all currently loaded lists via the no-copy path. These lists will
+    # subsequently be reloaded from the external CPU backing during search.
+    reclaimed = faiss.evict_ivf_lists(gpu_index, load_ids)
+    assert reclaimed.shape[0] == len(load_ids)
+
+    # After no-copy eviction, search results should still match the CPU index.
+    D_gpu, I_gpu = gpu_index.search(xq, k)
+    np.testing.assert_array_equal(I_cpu, I_gpu)
+    np.testing.assert_array_almost_equal(D_cpu, D_gpu, decimal=4)

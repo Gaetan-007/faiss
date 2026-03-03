@@ -14,6 +14,7 @@
 #include <faiss/gpu/impl/IVFFlat.cuh>
 #include <faiss/gpu/utils/CopyUtils.cuh>
 #include <faiss/gpu/utils/Float16.cuh>
+#include <faiss/utils/Heap.h>
 
 #if defined USE_NVIDIA_CUVS
 #include <cuvs/neighbors/ivf_flat.hpp>
@@ -46,6 +47,12 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
                   config),
           ivfFlatConfig_(config),
           reserveMemoryVecs_(0) {
+    // Initialize miss policy from config; by default, preserve historical
+    // behavior (Error) unless the caller explicitly requests otherwise.
+    missPolicy_ = ivfFlatConfig_.missPolicy;
+    if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        autoFetchEnabled_ = true;
+    }
     copyFrom(index);
 }
 
@@ -58,6 +65,10 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
         : GpuIndexIVF(provider, dims, metric, 0, nlist, config),
           ivfFlatConfig_(config),
           reserveMemoryVecs_(0) {
+    missPolicy_ = ivfFlatConfig_.missPolicy;
+    if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        autoFetchEnabled_ = true;
+    }
     // We haven't trained ourselves, so don't construct the IVFFlat
     // index yet
 }
@@ -79,6 +90,10 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
                   config),
           ivfFlatConfig_(config),
           reserveMemoryVecs_(0) {
+    missPolicy_ = ivfFlatConfig_.missPolicy;
+    if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        autoFetchEnabled_ = true;
+    }
     // We could have been passed an already trained coarse quantizer. There is
     // no other quantizer that we need to train, so this is sufficient
     if (this->is_trained) {
@@ -123,6 +138,8 @@ void GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
 
     // Clear out our old data
     index_.reset();
+    cpuListCache_.clear();
+    externalIndex_ = nullptr;
 
     // skip base class allocations if cuVS is enabled
     if (!should_use_cuvs(config_)) {
@@ -163,6 +180,9 @@ void GpuIndexIVFFlat::copyFromSelective(
     DeviceScope scope(config_.device);
 
     FAISS_THROW_IF_NOT_MSG(index, "copyFromSelective: index must not be null");
+
+    // Record external CPU backing index for later no-copy eviction and loads.
+    externalIndex_ = index;
 
     // This will copy GpuIndexIVF data such as the coarse quantizer
     GpuIndexIVF::copyFrom(index);
@@ -228,8 +248,6 @@ void GpuIndexIVFFlat::copyFromSelective(
         const auto* codes =
                 reinterpret_cast<const uint8_t*>(invlists->get_codes(listId));
         const auto* ids = invlists->get_ids(listId);
-        const size_t codesBytes =
-                static_cast<size_t>(numVecs) * index->code_size;
 
         FAISS_THROW_IF_NOT_MSG(
                 codes,
@@ -248,11 +266,10 @@ void GpuIndexIVFFlat::copyFromSelective(
                     numVecs);
         } else {
             CpuListCache cache;
-            cache.codes.resize(codesBytes);
-            std::memcpy(cache.codes.data(), codes, codesBytes);
-            if (ids) {
-                cache.ids.assign(ids, ids + numVecs);
-            }
+            cache.backingType = CpuCacheBackingType::ExternalInvlists;
+            cache.state = CpuCacheState::Clean;
+            cache.externalIndex = index;
+            cache.externalListId = listId;
             cpuListCache_.emplace(listId, std::move(cache));
         }
     }
@@ -321,15 +338,73 @@ size_t GpuIndexIVFFlat::evictCentroidToCpu(idx_t listId) {
             listId,
             nlist);
 
-    if (cpuListCache_.count(listId)) {
+    auto it = cpuListCache_.find(listId);
+    if (it != cpuListCache_.end()) {
+        // Already known to be backed by CPU (either internal copy or external);
+        // nothing to do.
         return 0;
     }
 
+    // If no-copy eviction is enabled and we have an external CPU backing
+    // index, avoid issuing a GPU->CPU copy and rely on that backing instead.
+    if (allowNoCopyEvict_) {
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::evictCentroidToCpu: no external backing "
+                "IndexIVFFlat configured for no-copy eviction");
+
+        auto* invlists = externalIndex_->invlists;
+        FAISS_THROW_IF_NOT_MSG(
+                invlists,
+                "GpuIndexIVFFlat::evictCentroidToCpu: external backing index "
+                "has no invlists");
+
+        FAISS_THROW_IF_NOT_FMT(
+                listId >= 0 && listId < invlists->nlist,
+                "GpuIndexIVFFlat::evictCentroidToCpu: external list %ld out "
+                "of bounds (%ld lists total)",
+                listId,
+                invlists->nlist);
+
+        // Optionally validate list lengths when possible.
+        if (baseIndex_) {
+            auto cpuLen = invlists->list_size(listId);
+            auto gpuLen = baseIndex_->getListLength(listId);
+            FAISS_THROW_IF_NOT_FMT(
+                    cpuLen == gpuLen,
+                    "GpuIndexIVFFlat::evictCentroidToCpu: external list %ld "
+                    "length mismatch (CPU %ld, GPU %ld)",
+                    listId,
+                    cpuLen,
+                    gpuLen);
+        }
+
+        CpuListCache cache;
+        cache.backingType = CpuCacheBackingType::ExternalInvlists;
+        cache.state = CpuCacheState::Clean;
+        cache.externalIndex = externalIndex_;
+        cache.externalListId = listId;
+        cpuListCache_.emplace(listId, std::move(cache));
+
+        // Ensure any pending operations on the IVF lists complete before
+        // we reclaim device memory.
+        resources_->syncDefaultStream(config_.device);
+        return index_->evictList(listId);
+    }
+
+    // Fallback: perform a defensive GPU->CPU copy into an internal cache
+    // entry before evicting.
     CpuListCache cache;
+    cache.backingType = CpuCacheBackingType::InternalCopy;
+    cache.state = CpuCacheState::Clean;
     cache.codes = index_->getListVectorData(listId, false);
     cache.ids = index_->getListIndices(listId);
-
     cpuListCache_.emplace(listId, std::move(cache));
+
+    // Sync before evictList: copyToHost uses cudaMemcpyAsync; we must ensure
+    // the copy completes before freeing device memory (prevents use-after-free
+    // and pool corruption when setDeviceMemoryReservation is used).
+    resources_->syncDefaultStream(config_.device);
 
     return index_->evictList(listId);
 }
@@ -351,21 +426,79 @@ size_t GpuIndexIVFFlat::loadCentroidToGpu(idx_t listId) {
     }
 
     auto& cache = it->second;
-    auto numVecs = (idx_t)cache.ids.size();
+    size_t bytesLoaded = 0;
 
-    if (ivfFlatConfig_.indicesOptions != INDICES_IVF) {
+    if (cache.backingType == CpuCacheBackingType::InternalCopy) {
+        auto numVecs = (idx_t)cache.ids.size();
+        if (numVecs == 0 && !cache.codes.empty()) {
+            numVecs = (idx_t)(cache.codes.size() / (this->d * sizeof(float)));
+        }
+
+        if (ivfFlatConfig_.indicesOptions != INDICES_IVF && numVecs > 0) {
+            FAISS_THROW_IF_NOT_MSG(
+                    !cache.ids.empty(),
+                    "Cached IVF list is missing indices for GPU load");
+        }
+
+        index_->addEncodedVectorsToListFromCpu(
+                listId,
+                cache.codes.data(),
+                cache.ids.empty() ? nullptr : cache.ids.data(),
+                numVecs);
+
+        bytesLoaded =
+                cache.codes.size() + cache.ids.size() * sizeof(idx_t);
+    } else if (cache.backingType == CpuCacheBackingType::ExternalInvlists) {
         FAISS_THROW_IF_NOT_MSG(
-                !cache.ids.empty(),
-                "Cached IVF list is missing indices for GPU load");
+                cache.externalIndex,
+                "loadCentroidToGpu: external-backed cache entry has no "
+                "source IndexIVFFlat");
+
+        auto* invlists = cache.externalIndex->invlists;
+        FAISS_THROW_IF_NOT_MSG(
+                invlists,
+                "loadCentroidToGpu: external backing index has no invlists");
+
+        FAISS_THROW_IF_NOT_FMT(
+                cache.externalListId >= 0 &&
+                        cache.externalListId < invlists->nlist,
+                "loadCentroidToGpu: external list %ld out of bounds (%ld "
+                "lists total)",
+                cache.externalListId,
+                invlists->nlist);
+
+        auto numVecs = invlists->list_size(cache.externalListId);
+        if (numVecs == 0) {
+            cpuListCache_.erase(it);
+            return 0;
+        }
+
+        const auto* codes = reinterpret_cast<const uint8_t*>(
+                invlists->get_codes(cache.externalListId));
+        const auto* ids = invlists->get_ids(cache.externalListId);
+
+        FAISS_THROW_IF_NOT_MSG(
+                codes,
+                "loadCentroidToGpu: external-backed IVF list has null codes");
+        if (ivfFlatConfig_.indicesOptions != INDICES_IVF && numVecs > 0) {
+            FAISS_THROW_IF_NOT_MSG(
+                    ids,
+                    "loadCentroidToGpu: external-backed IVF list is missing "
+                    "indices");
+        }
+
+        index_->addEncodedVectorsToListFromCpu(listId, codes, ids, numVecs);
+
+        bytesLoaded = static_cast<size_t>(numVecs) *
+                static_cast<size_t>(cache.externalIndex->code_size);
+        if (ids) {
+            bytesLoaded += static_cast<size_t>(numVecs) * sizeof(idx_t);
+        }
+    } else {
+        FAISS_THROW_MSG(
+                "loadCentroidToGpu: unknown CpuCacheBackingType for IVF list");
     }
 
-    index_->addEncodedVectorsToListFromCpu(
-            listId,
-            cache.codes.data(),
-            cache.ids.empty() ? nullptr : cache.ids.data(),
-            numVecs);
-
-    size_t bytesLoaded = cache.codes.size() + cache.ids.size() * sizeof(idx_t);
     cpuListCache_.erase(it);
 
     return bytesLoaded;
@@ -465,10 +598,50 @@ bool GpuIndexIVFFlat::processSharedMemoryCommand(const char* shmName) {
 
 void GpuIndexIVFFlat::setAutoFetch(bool enable) {
     autoFetchEnabled_ = enable;
+    if (enable) {
+        // Align the higher-level policy with the legacy auto-fetch flag
+        missPolicy_ = IvfListMissPolicy::AutoFetch;
+    } else if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        // Revert to the historical default behavior when disabling auto-fetch
+        missPolicy_ = IvfListMissPolicy::Error;
+    }
 }
 
 bool GpuIndexIVFFlat::isAutoFetchEnabled() const {
-    return autoFetchEnabled_;
+    // Keep this in sync with the miss policy; callers that only know about
+    // the legacy API still see consistent behavior.
+    return missPolicy_ == IvfListMissPolicy::AutoFetch;
+}
+
+void GpuIndexIVFFlat::setMissPolicy(IvfListMissPolicy policy) {
+    missPolicy_ = policy;
+
+    // Auto-fetch flag is an implementation detail of the AutoFetch policy.
+    if (policy == IvfListMissPolicy::AutoFetch) {
+        autoFetchEnabled_ = true;
+    } else {
+        autoFetchEnabled_ = false;
+    }
+}
+
+IvfListMissPolicy GpuIndexIVFFlat::getMissPolicy() const {
+    return missPolicy_;
+}
+
+void GpuIndexIVFFlat::setNoCopyEvictEnabled(bool enable) {
+    if (enable) {
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::setNoCopyEvictEnabled: no external "
+                "IndexIVFFlat backing configured; build this index with "
+                "copyFromSelective or provide an external backing index "
+                "before enabling no-copy eviction");
+    }
+    allowNoCopyEvict_ = enable;
+}
+
+bool GpuIndexIVFFlat::isNoCopyEvictEnabled() const {
+    return allowNoCopyEvict_;
 }
 
 bool GpuIndexIVFFlat::isListOnGpu(idx_t listId) const {
@@ -554,42 +727,290 @@ void GpuIndexIVFFlat::searchImpl_(
     // Device should already be set by GpuIndex::search
     DeviceScope scope(config_.device);
 
-    // If auto-fetch is not enabled, just call parent implementation
-    if (!autoFetchEnabled_ || cpuListCache_.empty()) {
+    // Fast path: if no special miss policy or no CPU-side cached lists,
+    // delegate to the base IVF implementation.
+    if (missPolicy_ == IvfListMissPolicy::Error || cpuListCache_.empty()) {
+        if (missPolicy_ == IvfListMissPolicy::AutoFetch &&
+            !cpuListCache_.empty()) {
+            // fall through to AutoFetch handling below
+        } else {
+            GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+            return;
+        }
+    }
+
+    auto stream = resources_->getDefaultStream(config_.device);
+
+    // Existing AutoFetch behavior: pre-load any missing lists to GPU, then
+    // delegate to the base implementation.
+    if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        if (cpuListCache_.empty()) {
+            GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+            return;
+        }
+
+        int use_nprobe = getCurrentNProbe_(params);
+
+        // Allocate space for coarse quantizer results
+        std::vector<idx_t> coarseIndices(n * use_nprobe);
+        std::vector<float> coarseDistances(n * use_nprobe);
+
+        // Perform coarse quantizer search to get which lists we need
+        quantizer->search(
+                n,
+                x,
+                use_nprobe,
+                coarseDistances.data(),
+                coarseIndices.data());
+
+        // Deduplicate the list IDs we need to access
+        std::unordered_set<idx_t> uniqueListIds(
+                coarseIndices.begin(), coarseIndices.end());
+        std::vector<idx_t> listIdsToCheck(
+                uniqueListIds.begin(), uniqueListIds.end());
+
+        // Fetch any missing lists from CPU cache
+        // Note: we cast away const here because auto-fetch modifies internal
+        // state. This is acceptable because the logical result of the search
+        // does not change.
+        const_cast<GpuIndexIVFFlat*>(this)->fetchMissingListsForSearch_(
+                listIdsToCheck);
+
+        // Now perform the actual search
         GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
         return;
     }
 
-    // We need to determine which IVF lists will be accessed
-    // This requires a coarse quantizer search first
-    int use_nprobe = getCurrentNProbe_(params);
-    auto stream = resources_->getDefaultStream(config_.device);
+    // New CpuOffload behavior: perform a joint GPU + CPU search where probed
+    // lists that are resident on GPU are searched on GPU, and probed lists
+    // that have been evicted are searched on CPU, with results merged on CPU.
+    if (missPolicy_ == IvfListMissPolicy::CpuOffload) {
+        // If there are no cached lists, just run a pure-GPU search.
+        if (cpuListCache_.empty()) {
+            GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+            return;
+        }
 
-    // Allocate space for coarse quantizer results
-    std::vector<idx_t> coarseIndices(n * use_nprobe);
-    std::vector<float> coarseDistances(n * use_nprobe);
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::searchImpl_: CpuOffload policy requires an "
+                "external CPU IndexIVFFlat backing index (configure via "
+                "copyFromSelective or equivalent)");
 
-    // Perform coarse quantizer search to get which lists we need
-    quantizer->search(
-            n,
-            x,
-            use_nprobe,
-            coarseDistances.data(),
-            coarseIndices.data());
+        // Determine how many probes we should use.
+        int use_nprobe = getCurrentNProbe_(params);
+        FAISS_THROW_IF_NOT(use_nprobe > 0);
 
-    // Deduplicate the list IDs we need to access
-    std::unordered_set<idx_t> uniqueListIds(
-            coarseIndices.begin(), coarseIndices.end());
-    std::vector<idx_t> listIdsToCheck(uniqueListIds.begin(), uniqueListIds.end());
+        // Copy queries back to host once so they can be reused by both the
+        // GPU preassigned path and the CPU IndexIVFFlat search.
+        auto hostQueries = toHost<float, 2>(
+                const_cast<float*>(x), stream, {n, this->d});
 
-    // Fetch any missing lists from CPU cache
-    // Note: we cast away const here because auto-fetch modifies internal state
-    // This is acceptable because the logical result of the search doesn't change
-    const_cast<GpuIndexIVFFlat*>(this)->fetchMissingListsForSearch_(
-            listIdsToCheck);
+        // Coarse quantization on the host queries to obtain list assignments
+        // and distances to IVF centroids.
+        std::vector<idx_t> coarseIndices(n * use_nprobe);
+        std::vector<float> coarseDistances(n * use_nprobe);
 
-    // Now perform the actual search
+        quantizer->search(
+                n,
+                hostQueries.data(),
+                use_nprobe,
+                coarseDistances.data(),
+                coarseIndices.data());
+
+        // Partition assignments into GPU-handled and CPU-handled lists.
+        size_t totalProbes = (size_t)n * (size_t)use_nprobe;
+        std::vector<idx_t> assignGpu(totalProbes, (idx_t)-1);
+        std::vector<idx_t> assignCpu(totalProbes, (idx_t)-1);
+
+        bool hasGpuLists = false;
+        bool hasCpuLists = false;
+
+        for (idx_t i = 0; i < n; ++i) {
+            for (int p = 0; p < use_nprobe; ++p) {
+                size_t pos = (size_t)i * (size_t)use_nprobe + (size_t)p;
+                idx_t key = coarseIndices[pos];
+
+                if (key < 0) {
+                    continue;
+                }
+
+                FAISS_THROW_IF_NOT_FMT(
+                        key < nlist,
+                        "GpuIndexIVFFlat::searchImpl_: invalid IVF list id %ld "
+                        "(nlist %ld)",
+                        key,
+                        nlist);
+
+                bool onGpu = index_ && index_->isListOnGpu(key);
+                auto cpuIt = cpuListCache_.find(key);
+                bool inCpuCache = cpuIt != cpuListCache_.end();
+
+                if (onGpu) {
+                    assignGpu[pos] = key;
+                    hasGpuLists = true;
+                } else if (inCpuCache) {
+                    assignCpu[pos] = key;
+                    hasCpuLists = true;
+                } else {
+                    FAISS_THROW_IF_NOT_MSG(
+                            false,
+                            "GpuIndexIVFFlat::searchImpl_: CpuOffload policy "
+                            "requires probed lists to be either resident on "
+                            "GPU or present in CPU cache / external backing");
+                }
+            }
+        }
+
+        // Prepare IVF search parameters for both GPU and CPU preassigned search
+        IVFSearchParameters baseParams;
+        const IVFSearchParameters* userParams =
+                dynamic_cast<const IVFSearchParameters*>(params);
+        if (userParams) {
+            baseParams = *userParams;
+        }
+        baseParams.nprobe = (size_t)use_nprobe;
+        baseParams.max_codes = 0;
+
+        // GPU partial results
+        std::vector<float> D_gpu;
+        std::vector<idx_t> I_gpu;
+
+        if (hasGpuLists) {
+            D_gpu.resize((size_t)n * (size_t)k);
+            I_gpu.resize((size_t)n * (size_t)k);
+
+            // Use the GPU preassigned search path restricted to GPU-resident
+            // lists.
+            this->search_preassigned(
+                    n,
+                    hostQueries.data(),
+                    k,
+                    assignGpu.data(),
+                    coarseDistances.data(),
+                    D_gpu.data(),
+                    I_gpu.data(),
+                    /*store_pairs=*/false,
+                    &baseParams,
+                    /*stats=*/nullptr);
+        }
+
+        // CPU partial results
+        std::vector<float> D_cpu;
+        std::vector<idx_t> I_cpu;
+
+        if (hasCpuLists) {
+            D_cpu.resize((size_t)n * (size_t)k);
+            I_cpu.resize((size_t)n * (size_t)k);
+
+            externalIndex_->search_preassigned(
+                    n,
+                    hostQueries.data(),
+                    k,
+                    assignCpu.data(),
+                    coarseDistances.data(),
+                    D_cpu.data(),
+                    I_cpu.data(),
+                    /*store_pairs=*/false,
+                    &baseParams,
+                    /*stats=*/nullptr);
+        }
+
+        // Merge GPU and CPU results per query on the CPU.
+        std::vector<float> finalDistances((size_t)n * (size_t)k);
+        std::vector<idx_t> finalLabels((size_t)n * (size_t)k);
+
+        if (hasGpuLists && hasCpuLists) {
+            // Two-way merge between GPU and CPU shards.
+            std::vector<float> allDistances(2 * (size_t)n * (size_t)k);
+            std::vector<idx_t> allLabels(2 * (size_t)n * (size_t)k);
+
+            size_t blockSize = (size_t)n * (size_t)k;
+            std::copy(D_gpu.begin(), D_gpu.end(), allDistances.begin());
+            std::copy(
+                    D_cpu.begin(),
+                    D_cpu.end(),
+                    allDistances.begin() + blockSize);
+
+            std::copy(I_gpu.begin(), I_gpu.end(), allLabels.begin());
+            std::copy(
+                    I_cpu.begin(),
+                    I_cpu.end(),
+                    allLabels.begin() + blockSize);
+
+            if (metric_type == METRIC_L2) {
+                merge_knn_results<idx_t, CMin<float, int>>(
+                        (size_t)n,
+                        (size_t)k,
+                        2,
+                        allDistances.data(),
+                        allLabels.data(),
+                        finalDistances.data(),
+                        finalLabels.data());
+            } else {
+                merge_knn_results<idx_t, CMax<float, int>>(
+                        (size_t)n,
+                        (size_t)k,
+                        2,
+                        allDistances.data(),
+                        allLabels.data(),
+                        finalDistances.data(),
+                        finalLabels.data());
+            }
+        } else if (hasGpuLists) {
+            finalDistances = std::move(D_gpu);
+            finalLabels = std::move(I_gpu);
+        } else if (hasCpuLists) {
+            finalDistances = std::move(D_cpu);
+            finalLabels = std::move(I_cpu);
+        } else {
+            // No valid lists at all (all assignments < 0); fill with neutral
+            // values.
+            float neutral =
+                    (metric_type == METRIC_L2)
+                    ? std::numeric_limits<float>::infinity()
+                    : -std::numeric_limits<float>::infinity();
+            std::fill(finalDistances.begin(), finalDistances.end(), neutral);
+            std::fill(finalLabels.begin(), finalLabels.end(), idx_t(-1));
+        }
+
+        // Copy merged results back to the device buffers expected by
+        // GpuIndex::search, so that the higher-level code can copy them back
+        // to the user-provided host arrays.
+        size_t numVals = (size_t)n * (size_t)k;
+        CUDA_VERIFY(cudaMemcpyAsync(
+                distances,
+                finalDistances.data(),
+                numVals * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream));
+        CUDA_VERIFY(cudaMemcpyAsync(
+                labels,
+                finalLabels.data(),
+                numVals * sizeof(idx_t),
+                cudaMemcpyHostToDevice,
+                stream));
+
+        return;
+    }
+
+    // Fallback safety: if we reach here with an unknown policy value, just
+    // delegate to the base IVF implementation.
     GpuIndexIVF::searchImpl_(n, x, k, distances, labels, params);
+}
+
+void GpuIndexIVFFlat::addImpl_(idx_t n, const float* x, const idx_t* ids) {
+    // When no-copy eviction with external CPU backing is enabled, we require
+    // the IVF lists to remain consistent with the external source. For now,
+    // enforce a read-only policy in this mode to avoid silent divergence.
+    if (allowNoCopyEvict_ && externalIndex_) {
+        FAISS_THROW_MSG(
+                "GpuIndexIVFFlat::addImpl_: adding vectors is not allowed "
+                "while no-copy eviction with external CPU backing is "
+                "enabled; build a new GPU index or disable no-copy eviction");
+    }
+
+    GpuIndexIVF::addImpl_(n, x, ids);
 }
 
 void GpuIndexIVFFlat::train(idx_t n, const float* x) {

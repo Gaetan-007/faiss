@@ -9,6 +9,9 @@
 
 #include <faiss/IndexIVF.h>
 #include <faiss/IndexShards.h>
+#include <faiss/IVFEvictLoadInterface.h>
+#include <cstdint>
+#include <vector>
 
 namespace faiss {
 
@@ -37,6 +40,26 @@ struct IndexShardsIVF : public IndexShards, Level1Quantizer {
             distance_t* distances,
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
+
+    /// Set list-to-shard mapping for evict/load forwarding (used by multi-GPU
+    /// IVF sharding). Must be called after add_shard. list_to_shard[listId]
+    /// gives the shard index owning that list.
+    void setListToShardMapping(const std::vector<int>& list_to_shard);
+
+    /// Evict/load forwarding: dispatch to the shard that owns each list.
+    /// Requires setListToShardMapping to have been called and shards to be
+    /// IVFEvictLoadInterface (e.g. GpuIndexIVFFlat).
+    size_t evictCentroidToCpu(idx_t listId);
+    size_t loadCentroidToGpu(idx_t listId);
+    std::vector<uint64_t> evictCentroidsToCpu(
+            const std::vector<idx_t>& listIds);
+    std::vector<uint64_t> loadCentroidsToGpu(
+            const std::vector<idx_t>& listIds);
+    bool isListOnGpu(idx_t listId) const;
+    std::vector<idx_t> getEvictedLists() const;
+
+ private:
+    std::vector<int> list_to_shard_;
 };
 
 } // namespace faiss

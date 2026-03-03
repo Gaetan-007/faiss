@@ -58,7 +58,10 @@ struct GpuMultipleClonerOptions : public GpuClonerOptions {
     /// across GPUs
     bool shard = false;
 
-    /// IndexIVF::copy_subset_to subset type
+    /// IndexIVF::copy_subset_to subset type (or copy_lists_to for type 5).
+    /// 1=by vector id, 2=by dimension, 3=by dimension with wrap, 4=by nlist
+    /// (contiguous ranges), 5=by nlist with load balancing (greedy bin packing
+    /// by IVFLists bytes). Type 5 balances vector data across GPUs.
     int shard_type = 1;
 
     /// set to true if an IndexIVF is to be dispatched to multiple GPUs with a

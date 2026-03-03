@@ -10,6 +10,7 @@
 #include <faiss/IndexShardsIVF.h>
 
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 
@@ -240,6 +241,87 @@ void IndexShardsIVF::search(
                 distances,
                 labels);
     }
+}
+
+void IndexShardsIVF::setListToShardMapping(
+        const std::vector<int>& list_to_shard) {
+    list_to_shard_ = list_to_shard;
+}
+
+size_t IndexShardsIVF::evictCentroidToCpu(idx_t listId) {
+    FAISS_THROW_IF_NOT(listId < nlist);
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "evict requires setListToShardMapping to have been called");
+    int s = list_to_shard_[listId];
+    auto* iface = dynamic_cast<IVFEvictLoadInterface*>(this->at(s));
+    FAISS_THROW_IF_NOT_MSG(
+            iface, "evict requires IVFEvictLoadInterface shards (e.g. GpuIndexIVFFlat)");
+    return iface->evictCentroidToCpu(listId);
+}
+
+size_t IndexShardsIVF::loadCentroidToGpu(idx_t listId) {
+    FAISS_THROW_IF_NOT(listId < nlist);
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "load requires setListToShardMapping to have been called");
+    int s = list_to_shard_[listId];
+    auto* iface = dynamic_cast<IVFEvictLoadInterface*>(this->at(s));
+    FAISS_THROW_IF_NOT_MSG(
+            iface, "load requires IVFEvictLoadInterface shards (e.g. GpuIndexIVFFlat)");
+    return iface->loadCentroidToGpu(listId);
+}
+
+std::vector<uint64_t> IndexShardsIVF::evictCentroidsToCpu(
+        const std::vector<idx_t>& listIds) {
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "evict requires setListToShardMapping to have been called");
+    std::vector<uint64_t> out(listIds.size());
+    for (size_t i = 0; i < listIds.size(); i++) {
+        out[i] = static_cast<uint64_t>(evictCentroidToCpu(listIds[i]));
+    }
+    return out;
+}
+
+std::vector<uint64_t> IndexShardsIVF::loadCentroidsToGpu(
+        const std::vector<idx_t>& listIds) {
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "load requires setListToShardMapping to have been called");
+    std::vector<uint64_t> out(listIds.size());
+    for (size_t i = 0; i < listIds.size(); i++) {
+        out[i] = static_cast<uint64_t>(loadCentroidToGpu(listIds[i]));
+    }
+    return out;
+}
+
+bool IndexShardsIVF::isListOnGpu(idx_t listId) const {
+    FAISS_THROW_IF_NOT(listId < nlist);
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "isListOnGpu requires setListToShardMapping to have been called");
+    int s = list_to_shard_[listId];
+    auto* iface = dynamic_cast<const IVFEvictLoadInterface*>(this->at(s));
+    FAISS_THROW_IF_NOT_MSG(
+            iface, "isListOnGpu requires IVFEvictLoadInterface shards");
+    return iface->isListOnGpu(listId);
+}
+
+std::vector<idx_t> IndexShardsIVF::getEvictedLists() const {
+    FAISS_THROW_IF_NOT_MSG(
+            !list_to_shard_.empty(),
+            "getEvictedLists requires setListToShardMapping to have been called");
+    std::vector<idx_t> result;
+    for (int s = 0; s < this->count(); s++) {
+        auto* iface = dynamic_cast<const IVFEvictLoadInterface*>(this->at(s));
+        if (!iface) {
+            continue;
+        }
+        std::vector<idx_t> evicted = iface->getEvictedLists();
+        result.insert(result.end(), evicted.begin(), evicted.end());
+    }
+    return result;
 }
 
 } // namespace faiss

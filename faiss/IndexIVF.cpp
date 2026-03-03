@@ -1269,6 +1269,12 @@ void IndexIVF::copy_subset_to(
             invlists->copy_subset_to(*other.invlists, subset_type, a1, a2);
 }
 
+void IndexIVF::copy_lists_to(
+        IndexIVF& other,
+        const std::vector<idx_t>& list_ids) const {
+    other.ntotal += invlists->copy_lists_to(*other.invlists, list_ids);
+}
+
 IndexIVF::~IndexIVF() {
     if (own_invlists) {
         delete invlists;

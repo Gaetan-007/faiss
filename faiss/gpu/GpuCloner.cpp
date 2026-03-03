@@ -7,6 +7,8 @@
 
 #include <faiss/gpu/GpuCloner.h>
 #include <faiss/impl/FaissAssert.h>
+#include <algorithm>
+#include <cinttypes>
 #include <memory>
 #include <typeinfo>
 
@@ -322,6 +324,13 @@ void ToGpuClonerMultiple::copy_ivf_shard(
     }
 }
 
+void ToGpuClonerMultiple::copy_ivf_shard(
+        const IndexIVF* index_ivf,
+        IndexIVF* idx2,
+        const std::vector<idx_t>& list_ids) {
+    index_ivf->copy_lists_to(*idx2, list_ids);
+}
+
 Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
     idx_t n = sub_cloners.size();
 
@@ -357,6 +366,49 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
 
     std::vector<faiss::Index*> shards(n);
 
+    // For shard_type=5 (load-balanced), pre-compute list assignment
+    std::vector<std::vector<idx_t>> shard_list_ids(n);
+    std::vector<int> list_to_shard;
+    if (index_ivf && shard_type == 5) {
+        list_to_shard.resize(index_ivf->nlist);
+        size_t code_size = index_ivf->invlists->code_size;
+        std::vector<int64_t> list_bytes(index_ivf->nlist);
+        for (idx_t j = 0; j < index_ivf->nlist; j++) {
+            size_t sz = index_ivf->invlists->list_size(j);
+            list_bytes[j] =
+                    (int64_t)sz * ((int64_t)code_size + (int64_t)sizeof(idx_t));
+        }
+        std::vector<idx_t> sorted_by_size(index_ivf->nlist);
+        for (idx_t j = 0; j < index_ivf->nlist; j++) {
+            sorted_by_size[j] = j;
+        }
+        std::sort(
+                sorted_by_size.begin(),
+                sorted_by_size.end(),
+                [&list_bytes](idx_t a, idx_t b) {
+                    return list_bytes[a] > list_bytes[b];
+                });
+        std::vector<int64_t> shard_bytes(n, 0);
+        for (idx_t list_no : sorted_by_size) {
+            int best = 0;
+            for (int s = 1; s < (int)n; s++) {
+                if (shard_bytes[s] < shard_bytes[best]) {
+                    best = s;
+                }
+            }
+            shard_list_ids[best].push_back(list_no);
+            list_to_shard[list_no] = best;
+            shard_bytes[best] += list_bytes[list_no];
+        }
+        if (verbose) {
+            printf("IndexShards load-balanced: shard bytes ");
+            for (int s = 0; s < (int)n; s++) {
+                printf("%" PRId64 " ", (int64_t)shard_bytes[s]);
+            }
+            printf("\n");
+        }
+    }
+
 #pragma omp parallel for
     for (idx_t i = 0; i < n; i++) {
         // make a shallow copy
@@ -377,7 +429,11 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
             idx2.nprobe = index_ivfpq->nprobe;
             idx2.use_precomputed_table = 0;
             idx2.is_trained = index->is_trained;
-            copy_ivf_shard(index_ivfpq, &idx2, n, i);
+            if (shard_type == 5) {
+                copy_ivf_shard(index_ivfpq, &idx2, shard_list_ids[i]);
+            } else {
+                copy_ivf_shard(index_ivfpq, &idx2, n, i);
+            }
             shards[i] = sub_cloners[i].clone_Index(&idx2);
         } else if (index_ivfflat) {
             faiss::IndexIVFFlat idx2(
@@ -387,7 +443,11 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
                     index_ivfflat->metric_type);
             idx2.nprobe = index_ivfflat->nprobe;
             idx2.is_trained = index->is_trained;
-            copy_ivf_shard(index_ivfflat, &idx2, n, i);
+            if (shard_type == 5) {
+                copy_ivf_shard(index_ivfflat, &idx2, shard_list_ids[i]);
+            } else {
+                copy_ivf_shard(index_ivfflat, &idx2, n, i);
+            }
             shards[i] = sub_cloners[i].clone_Index(&idx2);
         } else if (index_ivfsq) {
             faiss::IndexIVFScalarQuantizer idx2(
@@ -401,7 +461,11 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
             idx2.nprobe = index_ivfsq->nprobe;
             idx2.is_trained = index->is_trained;
             idx2.sq = index_ivfsq->sq;
-            copy_ivf_shard(index_ivfsq, &idx2, n, i);
+            if (shard_type == 5) {
+                copy_ivf_shard(index_ivfsq, &idx2, shard_list_ids[i]);
+            } else {
+                copy_ivf_shard(index_ivfsq, &idx2, n, i);
+            }
             shards[i] = sub_cloners[i].clone_Index(&idx2);
         } else if (index_flat) {
             faiss::IndexFlat idx2(index->d, index->metric_type);
@@ -411,6 +475,15 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
                 idx_t i1 = index->ntotal * (i + 1) / n;
                 shards[i]->add(i1 - i0, index_flat->get_xb() + i0 * index->d);
             }
+        }
+    }
+
+    // Build list_to_shard for shard_type 4 (contiguous nlist ranges)
+    if (index_ivf && common_ivf_quantizer && shard_type == 4) {
+        list_to_shard.resize(index_ivf->nlist);
+        for (idx_t j = 0; j < index_ivf->nlist; j++) {
+            list_to_shard[j] = std::min(
+                    (int)((j * n) / index_ivf->nlist), (int)n - 1);
         }
     }
 
@@ -432,6 +505,10 @@ Index* ToGpuClonerMultiple::clone_Index_to_shards(const Index* index) {
 
     for (int i = 0; i < n; i++) {
         res->add_shard(shards[i]);
+    }
+    if (common_ivf_quantizer && index_ivf && !list_to_shard.empty()) {
+        dynamic_cast<IndexShardsIVF*>(res)->setListToShardMapping(
+                list_to_shard);
     }
     FAISS_ASSERT(index->ntotal == res->ntotal);
     return res;
