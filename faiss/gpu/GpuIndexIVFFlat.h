@@ -27,10 +27,33 @@ namespace gpu {
 class IVFFlat;
 class GpuIndexFlat;
 
+/// Policy for handling IVF list misses (when a probed list is not present
+/// on the GPU during search).
+///
+/// - Error:      current default; missing lists are considered an error and
+///               will typically result in a failed search.
+/// - AutoFetch:  existing behavior; missing lists are automatically fetched
+///               from CPU backing storage to the GPU before search.
+/// - CpuOffload: new behavior; missing lists remain on CPU and are searched
+///               there, with their results merged on CPU with GPU results.
+enum class IvfListMissPolicy : uint8_t {
+    Error = 0,
+    AutoFetch = 1,
+    CpuOffload = 2,
+};
+
 struct GpuIndexIVFFlatConfig : public GpuIndexIVFConfig {
     /// Use the alternative memory layout for the IVF lists
     /// (currently the default)
     bool interleavedLayout = true;
+
+    /// How to handle IVF list misses when a probed list is not currently
+    /// present on the GPU.
+    ///
+    /// This setting only affects GpuIndexIVFFlat; other IVF index types
+    /// ignore it. By default, behavior matches the historical implementation
+    /// (Error + explicit setAutoFetch for auto-fetch semantics).
+    IvfListMissPolicy missPolicy = IvfListMissPolicy::Error;
 };
 
 /// Wrapper around the GPU implementation that looks like
@@ -101,6 +124,17 @@ class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
     void train(idx_t n, const float* x) override;
 
     void reconstruct_n(idx_t i0, idx_t n, float* out) const override;
+
+    /// Configure how IVF list misses (for probed lists) are handled during
+    /// search. See IvfListMissPolicy for details.
+    ///
+    /// This API is complementary to setAutoFetch():
+    /// - setting missPolicy to AutoFetch will also enable auto-fetch;
+    /// - setting missPolicy to Error or CpuOffload will disable auto-fetch.
+    void setMissPolicy(IvfListMissPolicy policy);
+
+    /// Return the current IVF list miss policy.
+    IvfListMissPolicy getMissPolicy() const;
 
     /// NOTE: (wangzehao) This function is used to evict a single IVF list (centroid) to CPU memory and free GPU memory
     /// Evict a single IVF list (centroid) to CPU memory and free GPU memory
@@ -250,6 +284,9 @@ class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
     /// NOTE: (wangzehao) Auto-fetch (page-fault style) management members
     /// When true, search will automatically fetch missing lists from CPU
     bool autoFetchEnabled_ = false;
+
+    /// Current policy for handling IVF list misses during search.
+    IvfListMissPolicy missPolicy_ = IvfListMissPolicy::Error;
 
     /// When true, lists that have valid external CPU backing and are marked
     /// clean may be evicted without issuing a GPU->CPU copy.
