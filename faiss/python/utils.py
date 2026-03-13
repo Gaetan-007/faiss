@@ -5,6 +5,43 @@ import numpy as np
 from dataclasses import dataclass
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 import datasets
+import os
+import contextlib
+import io
+
+
+def _truthy_env(name: str, default: str = "1") -> bool:
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _maybe_quiet_hf_load() -> contextlib.AbstractContextManager:
+    """
+    Silence HuggingFace/transformers progress bars and noisy stdout during model load.
+
+    Default behavior is quiet. Set ABENCH_QUIET_MODEL_LOAD=0 to re-enable.
+    """
+    quiet = _truthy_env("ABENCH_QUIET_MODEL_LOAD", default="1")
+    if not quiet:
+        return contextlib.nullcontext()
+
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+    try:
+        from transformers.utils import logging as _tlog
+
+        _tlog.set_verbosity_error()
+        _tlog.disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        datasets.logging.set_verbosity_error()
+    except Exception:
+        pass
+
+    return contextlib.redirect_stdout(io.StringIO())
 
 @dataclass
 class BaseConfig:
@@ -59,14 +96,32 @@ def fvec_L2sqr(x, y):
 
 
 def load_model(model_path: str, use_fp16: bool = False):
-    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+    buf_err = io.StringIO()
+    try:
+        quiet = _truthy_env("ABENCH_QUIET_MODEL_LOAD", default="1")
+        if quiet:
+            with _maybe_quiet_hf_load(), contextlib.redirect_stderr(buf_err):
+                _ = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, use_fast=True, trust_remote_code=True
+                )
+        else:
+            _ = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, use_fast=True, trust_remote_code=True
+            )
+    except Exception as exc:
+        tail = (buf_err.getvalue() or "").strip()
+        if tail:
+            raise RuntimeError(f"failed to load model from {model_path}: {exc}\n{tail}") from exc
+        raise RuntimeError(f"failed to load model from {model_path}: {exc}") from exc
+
     model.eval()
     model.cuda()
     if use_fp16:
         model = model.half()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
-
     return model, tokenizer
 
 
@@ -94,7 +149,19 @@ def read_jsonl(file_path):
 
 
 def load_corpus(corpus_path: str):
-    return datasets.load_dataset(corpus_path, split="train")
+    import os
+    if not os.path.isfile(corpus_path):
+        raise FileNotFoundError(
+            f"Corpus file not found: {corpus_path!r}. "
+            "Ensure the path exists or set corpus_path (e.g. via --corpus_path or CORPUS_PATH env) to a valid .jsonl or .parquet file."
+        )
+    if corpus_path.endswith(".jsonl"):
+        return datasets.load_dataset("json", data_files=corpus_path, split="train")
+    if corpus_path.endswith(".parquet"):
+        return datasets.load_dataset("parquet", data_files=corpus_path, split="train")
+    raise ValueError(
+        f"Unsupported corpus format: {corpus_path!r}. Use .jsonl or .parquet."
+    )
 
 
 def load_docs(corpus, doc_idxs):

@@ -189,7 +189,7 @@ def client(mock_engine):
                 "index_type": "IVFFlat",
                 "index_path": "/fake/path/to/index.faiss",
                 "corpus_path": "/fake/path/to/corpus",
-                "retrieval_method": "sentence-transformers/all-MiniLM-L6-v2",
+                "retrieval_method": "/share_data/public_models/multilingual-e5-large",
                 "retrieval_topk": 10,
                 "retrieval_batch_size": 32,
                 "retrieval_query_max_length": 512,

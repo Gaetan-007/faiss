@@ -94,7 +94,19 @@ def read_jsonl(file_path):
 
 
 def load_corpus(corpus_path: str):
-    return datasets.load_dataset(corpus_path, split="train")
+    import os
+    if not os.path.isfile(corpus_path):
+        raise FileNotFoundError(
+            f"Corpus file not found: {corpus_path!r}. "
+            "Ensure the path exists or set corpus_path (e.g. via --corpus_path or CORPUS_PATH env) to a valid .jsonl or .parquet file."
+        )
+    if corpus_path.endswith(".jsonl"):
+        return datasets.load_dataset("json", data_files=corpus_path, split="train")
+    if corpus_path.endswith(".parquet"):
+        return datasets.load_dataset("parquet", data_files=corpus_path, split="train")
+    raise ValueError(
+        f"Unsupported corpus format: {corpus_path!r}. Use .jsonl or .parquet."
+    )
 
 
 def load_docs(corpus, doc_idxs):

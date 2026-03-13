@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -179,4 +182,82 @@ def test_cpu_offload_requires_external_backing():
     gpu_index.setMissPolicy(faiss.IvfListMissPolicy_CpuOffload)
     with pytest.raises(Exception):
         gpu_index.search(xq, k)
+
+
+def test_cpu_offload_miss_logging(tmp_path, monkeypatch):
+    if not _has_cpu_offload_enum():
+        pytest.skip("IvfListMissPolicy_CpuOffload not available in this build")
+
+    # Isolate log output under a temporary HOME directory
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    d = 64
+    nb = 2000
+    nq = 10
+    nlist = 64
+    nprobe = 8
+    k = 5
+
+    rng = np.random.RandomState(7)
+    xb = rng.random((nb, d)).astype("float32")
+    xq = rng.random((nq, d)).astype("float32")
+
+    cpu_index = _build_cpu_ivfflat(
+        xb=xb,
+        d=d,
+        nlist=nlist,
+        metric=faiss.METRIC_L2,
+        nprobe=nprobe,
+    )
+
+    unique_ids = _unique_list_ids(cpu_index, xq, cpu_index.nprobe)
+    if unique_ids.size < 2:
+        pytest.skip("Not enough IVF lists touched to induce misses")
+
+    # Load roughly half of the touched lists to GPU; the rest remain CPU-backed
+    half = max(1, unique_ids.size // 2)
+    lists_on_gpu = unique_ids[:half]
+
+    res = faiss.StandardGpuResources()
+    gpu_index = faiss.GpuIndexIVFFlat(
+        res,
+        cpu_index.d,
+        cpu_index.nlist,
+        cpu_index.metric_type,
+    )
+
+    faiss.init_ivf_lists_from_cpu(gpu_index, cpu_index, lists_on_gpu)
+    gpu_index.nprobe = cpu_index.nprobe
+
+    # Enable CpuOffload miss policy so that probed lists that were evicted
+    # will be searched on CPU and logged as misses.
+    gpu_index.setMissPolicy(faiss.IvfListMissPolicy_CpuOffload)
+
+    # Trigger at least one search; this should produce miss logs for queries
+    # whose probed lists are backed only by CPU.
+    gpu_index.search(xq, k)
+
+    log_dir = fake_home / ".faiss_log"
+    assert log_dir.is_dir(), "miss log directory was not created"
+
+    log_files = sorted(log_dir.glob("miss_log_*.log"))
+    assert log_files, "no miss log file created for CpuOffload policy"
+
+    # Inspect the latest log file
+    latest = log_files[-1]
+    lines = latest.read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "miss log file is empty"
+
+    last = lines[-1]
+    parts = last.split(",")
+    assert len(parts) == 4, f"unexpected log line format: {last!r}"
+
+    # Format: timestamp, miss_count, miss_centroids, policy
+    timestamp, miss_count_str, miss_centroids_str, policy_str = parts
+    assert policy_str == "CpuOffload"
+    miss_count = int(miss_count_str)
+    assert miss_count > 0
+    assert miss_centroids_str, "miss centroid list should not be empty"
 

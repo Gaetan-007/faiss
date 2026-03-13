@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict, OrderedDict, deque
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ..utils import *
 from .encoder import Encoder, STEncoder
 from typing import List, Dict, Optional
@@ -10,6 +10,7 @@ import threading
 import uuid
 import faiss
 import time
+import os
 import numpy as np
 from heapq import heappush, heappop
 from .scheduler import BaseScheduler, SchedulerRequest, FifoScheduler
@@ -89,9 +90,9 @@ class _EvictionTracker:
             return list_id
         return None
 
-
+@dataclass
 class FaissEnginConfig(BaseConfig):
-    """Config for all engines."""
+    """Config for all engines. Fields with defaults must come last."""
     index_type: str
     index_path: str
     corpus_path: str
@@ -99,7 +100,6 @@ class FaissEnginConfig(BaseConfig):
     retrieval_method: str
     retrieval_topk: int
     retrieval_batch_size: int
-    retrieval_model_path: Optional[str] = None
     retrieval_query_max_length: int
     retrieval_use_fp16: bool
     retrieval_pooling_method: str
@@ -116,6 +116,73 @@ class FaissEnginConfig(BaseConfig):
 
     # IVF Config
     nprobe: int
+
+    embedder_model_path: Optional[str] = None
+
+    # Optional: IVF list prewarm and mode (use getattr in code for compatibility)
+    ivf_init_strategy: Optional[str] = None
+    ivf_init_profile_path: Optional[str] = None
+    ivf_init_n: Optional[int] = None
+    mode: Optional[str] = None
+
+
+@dataclass
+class EmbeddingInfo:
+    """
+    Lightweight container for per-request embedding/debug information.
+    Only a minimal subset of fields and methods are implemented to satisfy
+    current ABench usage. Metrics helpers (e.g. show_inter_stage_diff) are
+    intentionally left unimplemented to avoid silently returning junk values.
+    """
+
+    query_emb: Optional[np.ndarray] = None
+    centroid_idx: List[np.ndarray] = field(default_factory=list)
+    centroid_distance: List[np.ndarray] = field(default_factory=list)
+    topk_score: List[np.ndarray] = field(default_factory=list)
+    largest_cluster: List[int] = field(default_factory=list)
+    doc_idx: List[List[int]] = field(default_factory=list)
+    retrieval_score: List[List[float]] = field(default_factory=list)
+
+    def update(
+        self,
+        query_emb=None,
+        centroid_idx=None,
+        centroid_distance=None,
+        topk_score=None,
+        largest_cluster=None,
+        doc_idx=None,
+        retrieval_score=None,
+    ) -> None:
+        if query_emb is not None:
+            # Keep the latest query embedding as a NumPy array.
+            self.query_emb = np.asarray(query_emb)
+        if centroid_idx is not None:
+            for c in centroid_idx:
+                self.centroid_idx.append(np.asarray(c))
+        if centroid_distance is not None:
+            for d in centroid_distance:
+                self.centroid_distance.append(np.asarray(d))
+        if topk_score is not None:
+            for s in topk_score:
+                self.topk_score.append(np.asarray(s))
+        if largest_cluster is not None:
+            self.largest_cluster.extend(list(largest_cluster))
+        if doc_idx is not None:
+            for di in doc_idx:
+                self.doc_idx.append(list(di))
+        if retrieval_score is not None:
+            self.retrieval_score.extend(list(retrieval_score))
+
+    def show_inter_stage_diff(self, taskid, metric: int = 1) -> float:
+        """
+        Placeholder implementation; the detailed similarity metric is not
+        required for current ABench workflows. Raise explicitly if called
+        so callers know the metric is unavailable.
+        """
+        raise NotImplementedError(
+            "EmbeddingInfo.show_inter_stage_diff is not implemented in this build"
+        )
+
 
 class BaseEngine(ABC):
     """Base engine for all retrievers."""
@@ -352,8 +419,8 @@ class FaissEngine(BaseEngine):
 
     def __init__(self, config: FaissEnginConfig):
         super().__init__(config)
-        if config.retrieval_model_path is None:
-            raise EngineError("retrieval_model_path must be provided in engine_config")
+        if config.embedder_model_path is None:
+            raise EngineError("embedder_model_path must be provided in engine_config")
         self.retrieval_method = config.retrieval_method
         self.topk = config.retrieval_topk
         # TODO: Handle different retrieval top-k
@@ -362,6 +429,8 @@ class FaissEngine(BaseEngine):
         self.return_embedding = config.return_embedding
         self.index_path = config.index_path
         self.corpus_path = config.corpus_path
+        self._gpu_resources = None
+        self._gpu_resource_device = None
 
         self.index = faiss.read_index(self.index_path)
 
@@ -370,14 +439,14 @@ class FaissEngine(BaseEngine):
         if config.use_sentence_transformer:
             self.encoder = STEncoder(
                 model_name=self.retrieval_method,
-                model_path=config.retrieval_model_path,
+                model_path=config.embedder_model_path,
                 max_length=config.retrieval_query_max_length,
                 use_fp16=config.retrieval_use_fp16,
             )
         else:
             self.encoder = Encoder(
                 model_name=self.retrieval_method,
-                model_path=config.retrieval_model_path,
+                model_path=config.embedder_model_path,
                 pooling_method=config.retrieval_pooling_method,
                 max_length=config.retrieval_query_max_length,
                 use_fp16=config.retrieval_use_fp16,
@@ -400,7 +469,17 @@ class FaissEngine(BaseEngine):
                 max_queue_size=getattr(config, "async_queue_size", 1024),
                 idle_sleep_s=getattr(config, "async_idle_sleep_s", 0.01),
             )
-    
+
+    def _add(self, query: str, return_centroid: bool, retrain: bool):
+        raise NotImplementedError(
+            "FaissEngine uses a pre-built index; add is not supported"
+        )
+
+    def _batch_add(self, query_list, return_centroid: bool, retrain: bool):
+        raise NotImplementedError(
+            "FaissEngine uses a pre-built index; batch_add is not supported"
+        )
+
     def reinit(self, config):
         self.config = config
         self.topk = config.retrieval_topk
@@ -473,13 +552,270 @@ class FaissEngine(BaseEngine):
         self.new_termination_point = []
         self.new_termination_point2 = []
         self.new_termination_point3 = []
+        self.onload_cluster = []
+        self.onload_cluster_hit = 0
+        self.total_cluster_search_num = 0
 
         self.larger_topk = config.larger_topk if config.larger_topk is not None else 20
         print(f"[Reordering setup]: topk as {self.topk} larger_topk as {self.larger_topk}")
 
         self._init_eviction_policy(config)
+        self._maybe_init_ivf_lists(config)
 
-        # self.simulate_onload_cluster(config)
+    def _maybe_init_ivf_lists(self, config) -> None:
+        """
+        Optionally prewarm IVF lists on GPU according to ivf_init_strategy.
+
+        Tests rely on _ivf_init_lists to record which lists were targeted.
+        """
+        strategy = getattr(config, "ivf_init_strategy", None)
+        if strategy is None:
+            return
+        strategy_norm = str(strategy).strip().lower()
+        if strategy_norm in {"", "none", "disabled"}:
+            return
+
+        nlist = int(getattr(self.index, "nlist", 0) or 0)
+        if nlist <= 0:
+            raise EngineError("ivf_init_strategy requires index.nlist > 0")
+
+        requested_n = getattr(config, "ivf_init_n", None)
+        init_n = self._resolve_ivf_init_n(requested_n, nlist)
+
+        if strategy_norm == "random":
+            list_ids = self._select_ivf_lists_random(nlist, init_n)
+        elif strategy_norm == "topk":
+            profile_path = getattr(config, "ivf_init_profile_path", None)
+            list_ids = self._select_ivf_lists_topk(profile_path, nlist, init_n)
+        else:
+            raise EngineError(
+                f"unsupported ivf_init_strategy '{strategy}'; must be one of: none, random, topk"
+            )
+
+        self._ivf_init_lists = [int(x) for x in list_ids]
+
+        # In auto_fetch mode, the first reinit can happen on CPU before index_cpu_to_gpu.
+        if self._supports_gpu_ivf_list_api():
+            self._prewarm_ivf_lists(self._ivf_init_lists)
+            return
+
+        mode_norm = str(getattr(config, "mode", "")).strip().lower()
+        if mode_norm in {"auto_fetch", "cpu_offload"}:
+            return
+        raise EngineError(
+            "ivf_init_strategy requires a GPU IVF index with list-level APIs. "
+            "Use auto_fetch/cpu_offload or move index to GPU before reinit."
+        )
+
+    def _supports_gpu_ivf_list_api(self) -> bool:
+        return (
+            hasattr(faiss, "load_ivf_lists")
+            and hasattr(faiss, "is_list_on_gpu")
+            and hasattr(self.index, "isListOnGpu")
+        )
+
+    def _prewarm_ivf_lists(self, list_ids: List[int]) -> None:
+        if not self._supports_gpu_ivf_list_api():
+            raise EngineError("GPU IVF list APIs are unavailable for ivf prewarm")
+        for list_id in list_ids:
+            try:
+                faiss.load_ivf_lists(self.index, int(list_id))
+            except Exception as exc:
+                if self._is_oom_error(exc):
+                    raise EngineError(
+                        "GPU OOM while prewarming IVF list "
+                        f"{int(list_id)}. Consider lowering ivf_init_n or "
+                        "gpu_memory_utilization."
+                    ) from exc
+                raise EngineError(
+                    f"failed to prewarm IVF list {int(list_id)} on "
+                    f"{self.index.__class__.__name__}: {exc}"
+                ) from exc
+            if not faiss.is_list_on_gpu(self.index, int(list_id)):
+                raise EngineError(
+                    f"ivf list {int(list_id)} was requested for prewarm but is not on GPU"
+                )
+            if getattr(self, "_eviction_enabled", False):
+                self._eviction_tracker.record_loaded(int(list_id))
+
+    def _get_cuda_mem_info(self, device_id: int):
+        try:
+            import torch
+        except Exception as exc:
+            raise EngineError(
+                "torch is required to query CUDA memory info for "
+                "gpu_memory_utilization reservation"
+            ) from exc
+        if not torch.cuda.is_available():
+            raise EngineError("CUDA is not available in torch")
+        if device_id < 0 or device_id >= torch.cuda.device_count():
+            raise EngineError(
+                f"invalid CUDA device_id={device_id}; device_count={torch.cuda.device_count()}"
+            )
+        with torch.cuda.device(device_id):
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return int(free_bytes), int(total_bytes)
+
+    @staticmethod
+    def _get_reservation_safety_bytes() -> int:
+        safety_env = os.environ.get("ABENCH_GPU_RESERVATION_SAFETY_GB", "2")
+        try:
+            safety_gb = float(safety_env)
+        except Exception as exc:
+            raise EngineError(
+                "ABENCH_GPU_RESERVATION_SAFETY_GB must be a number, "
+                f"got {safety_env!r}"
+            ) from exc
+        if safety_gb < 0:
+            raise EngineError(
+                "ABENCH_GPU_RESERVATION_SAFETY_GB must be >= 0, "
+                f"got {safety_gb}"
+            )
+        return int(safety_gb * (1024 ** 3))
+
+    @staticmethod
+    def _get_temp_memory_bytes() -> int:
+        temp_env = os.environ.get("ABENCH_FAISS_TEMP_MEMORY_MB", "256")
+        try:
+            temp_mb = float(temp_env)
+        except Exception as exc:
+            raise EngineError(
+                "ABENCH_FAISS_TEMP_MEMORY_MB must be a number, "
+                f"got {temp_env!r}"
+            ) from exc
+        if temp_mb < 0:
+            raise EngineError(
+                "ABENCH_FAISS_TEMP_MEMORY_MB must be >= 0, "
+                f"got {temp_mb}"
+            )
+        return int(temp_mb * (1024 ** 2))
+
+    def ensure_gpu_resources(self, config, device_id: int = 0):
+        if self._gpu_resources is not None and self._gpu_resource_device == int(device_id):
+            return self._gpu_resources
+        if not hasattr(faiss, "StandardGpuResources"):
+            raise EngineError("faiss.StandardGpuResources is unavailable")
+
+        try:
+            util = float(getattr(config, "gpu_memory_utilization"))
+        except Exception as exc:
+            raise EngineError("gpu_memory_utilization must be a float") from exc
+        if util <= 0 or util > 1:
+            raise EngineError(
+                f"gpu_memory_utilization must be in (0, 1], got {util}"
+            )
+
+        free_bytes, total_bytes = self._get_cuda_mem_info(int(device_id))
+        target_bytes = int(total_bytes * util)
+        safety_bytes = self._get_reservation_safety_bytes()
+        temp_bytes = self._get_temp_memory_bytes()
+        max_reservable = max(0, free_bytes - safety_bytes)
+        if target_bytes > max_reservable:
+            suggested = max(0.0, min(1.0, max_reservable / max(total_bytes, 1)))
+            raise EngineError(
+                "gpu memory reservation target exceeds available free memory: "
+                f"target={target_bytes / (1024 ** 3):.2f}GiB, "
+                f"free={free_bytes / (1024 ** 3):.2f}GiB, "
+                f"total={total_bytes / (1024 ** 3):.2f}GiB, "
+                f"safety={safety_bytes / (1024 ** 3):.2f}GiB, "
+                f"suggested_max_gpu_memory_utilization={suggested:.4f}"
+            )
+        if target_bytes <= 0:
+            raise EngineError(
+                f"computed reservation is non-positive ({target_bytes} bytes). "
+                "Check gpu_memory_utilization."
+            )
+        if temp_bytes >= target_bytes:
+            raise EngineError(
+                "faiss temp memory budget must be smaller than reserved GPU memory: "
+                f"temp={temp_bytes / (1024 ** 2):.2f}MiB, "
+                f"reservation={target_bytes / (1024 ** 2):.2f}MiB. "
+                "Lower ABENCH_FAISS_TEMP_MEMORY_MB or increase gpu_memory_utilization."
+            )
+
+        res = faiss.StandardGpuResources()
+        try:
+            res.setTempMemory(temp_bytes)
+            res.setDeviceMemoryReservation(target_bytes)
+        except Exception as exc:
+            raise EngineError(
+                "failed to configure faiss GPU memory reservation: "
+                f"{target_bytes / (1024 ** 3):.2f}GiB on device {int(device_id)} "
+                f"(temp_memory={temp_bytes / (1024 ** 2):.2f}MiB)"
+            ) from exc
+
+        self._gpu_resources = res
+        self._gpu_resource_device = int(device_id)
+        return self._gpu_resources
+
+    @staticmethod
+    def _resolve_ivf_init_n(requested_n, nlist: int) -> int:
+        if requested_n is None:
+            # Heuristic: default to a small fraction of lists if not specified.
+            est = max(1, int(round(nlist * 0.1)))
+            requested_n = est
+        try:
+            init_n = int(requested_n)
+        except Exception as exc:
+            raise EngineError(f"ivf_init_n must be an int, got {requested_n!r}") from exc
+        if init_n <= 0:
+            raise EngineError("ivf_init_n must be > 0")
+        return min(init_n, nlist)
+
+    @staticmethod
+    def _select_ivf_lists_random(nlist: int, init_n: int) -> List[int]:
+        if init_n <= 0:
+            raise EngineError("ivf_init_n must be > 0 for random init")
+        init_n = min(int(init_n), int(nlist))
+        candidates = np.arange(nlist, dtype=np.int64)
+        # Use np.random.choice so tests can monkeypatch deterministically.
+        chosen = np.random.choice(candidates, size=init_n, replace=False)
+        chosen = np.asarray(chosen).reshape(-1)
+        return [int(x) for x in chosen.tolist()]
+
+    @staticmethod
+    def _select_ivf_lists_topk(profile_path: Optional[str], nlist: int, init_n: int) -> List[int]:
+        if profile_path is None or str(profile_path).strip() == "":
+            raise EngineError("ivf_init_profile_path must be provided for topk init")
+        import os
+        import json
+
+        if not os.path.isfile(profile_path):
+            raise EngineError(f"ivf_init_profile_path not found: {profile_path}")
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:
+            raise EngineError(f"failed to load ivf init profile json: {profile_path}") from exc
+
+        if not isinstance(raw, dict):
+            raise EngineError("ivf init profile must be a JSON object mapping list_id -> count")
+
+        items = []
+        for k, v in raw.items():
+            try:
+                lid = int(k)
+            except Exception:
+                continue
+            if lid < 0 or lid >= nlist:
+                continue
+            try:
+                count = int(v)
+            except Exception:
+                continue
+            items.append((lid, count))
+
+        if not items:
+            raise EngineError("ivf init profile contains no valid in-range list ids")
+
+        # Sort by frequency (desc), then by list id (asc) for deterministic tie-breaking.
+        items.sort(key=lambda x: (-x[1], x[0]))
+        chosen = [lid for lid, _ in items[:init_n]]
+        if len(chosen) < init_n:
+            raise EngineError(
+                f"ivf init profile has only {len(chosen)} valid list ids, but ivf_init_n={init_n}"
+            )
+        return chosen
 
     def _init_eviction_policy(self, config) -> None:
         policy = getattr(config, "eviction_policy", None)
@@ -501,8 +837,10 @@ class FaissEngine(BaseEngine):
         )
         if self._eviction_max_attempts <= 0:
             raise EvictionPolicyError("eviction_max_attempts must be > 0")
-
-        if hasattr(faiss, "set_auto_fetch"):
+        # Best-effort: if auto-fetch is available and the index supports it,
+        # disable it before enabling custom eviction, but don't fail hard if the
+        # underlying index does not expose GPU auto-fetch APIs (e.g., pure CPU).
+        if hasattr(faiss, "set_auto_fetch") and hasattr(self.index, "setAutoFetch"):
             try:
                 faiss.set_auto_fetch(self.index, False)
             except Exception as exc:
@@ -547,6 +885,8 @@ class FaissEngine(BaseEngine):
         if not to_load:
             return
         protected = set(required_list_ids)
+        for list_id in getattr(self, "_ivf_init_lists", []):
+            protected.add(int(list_id))
         for list_id in to_load:
             self._load_list_with_eviction(list_id, protected)
 
@@ -592,6 +932,49 @@ class FaissEngine(BaseEngine):
                     f"failed to evict IVF list {victim}"
                 ) from exc
 
+    def _maybe_post_batch_autofetch_evict(self, batch_assigned_centroids) -> None:
+        """
+        AutoFetch mode may keep fetched lists resident on GPU indefinitely.
+        To emulate page-fault behavior with per-batch reuse, evict probed lists
+        after each query batch, while keeping ivf_init preloaded lists resident.
+        """
+        mode = str(getattr(self.config, "mode", "")).strip().lower()
+        if mode != "auto_fetch":
+            return
+        if not hasattr(faiss, "evict_ivf_lists"):
+            raise EngineError("auto_fetch post-batch eviction requires faiss.evict_ivf_lists")
+
+        protected = set(int(x) for x in getattr(self, "_ivf_init_lists", []))
+        candidates = set()
+        flat = np.asarray(batch_assigned_centroids).reshape(-1)
+        for lid in flat.tolist():
+            try:
+                lid_int = int(lid)
+            except Exception:
+                continue
+            if lid_int >= 0 and lid_int not in protected:
+                candidates.add(lid_int)
+
+        if not candidates:
+            return
+
+        evict_ids = sorted(candidates)
+        if hasattr(faiss, "is_list_on_gpu"):
+            evict_ids = [
+                int(lid)
+                for lid in evict_ids
+                if faiss.is_list_on_gpu(self.index, int(lid))
+            ]
+        if not evict_ids:
+            return
+
+        try:
+            faiss.evict_ivf_lists(self.index, np.asarray(evict_ids, dtype=np.int64))
+        except Exception as exc:
+            raise EngineError(
+                f"failed to evict auto-fetch lists after batch: count={len(evict_ids)}"
+            ) from exc
+
     @staticmethod
     def _is_oom_error(exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -601,29 +984,6 @@ class FaissEngine(BaseEngine):
             or "cudamalloc" in msg
         )
     
-    def simulate_onload_cluster(self, config):
-
-        self.cluster_size = self.index.get_cluster_size_heterag([range(0, self.index.nlist)])[0]
-
-        available_gpu_memory = (1 - config.gpu_memory_utilization) * 0.6 * 80
-        
-        gpu_cluster_memory = 0
-        gpu_cluster_to_load = []
-        cluster_idx = 0
-        cluster_max = 1024
-        while (cluster_idx < self.index.nlist and cluster_idx < cluster_max and \
-        cluster_idx < len(kv_array) and gpu_cluster_memory < available_gpu_memory):
-            cluster_id = kv_array[cluster_idx][0]
-            gpu_cluster_memory += self.cluster_size[cluster_id] * self.index.d * 4 / 1024 / 1024 / 1024
-            gpu_cluster_to_load.append(cluster_id)
-            cluster_idx += 1
-        
-        print(f"onloading {cluster_idx} clusters")
-        self.onload_clusters(gpu_cluster_to_load)
-        self.onload_cluster = gpu_cluster_to_load
-        self.onload_cluster_hit = 0
-        self.total_cluster_search_num = 0
-
     def _search(self, query: str, num: int = None, return_score=False, eval_cache=False):
         if num is None:
             num = self.topk
@@ -679,7 +1039,15 @@ class FaissEngine(BaseEngine):
 
             self._maybe_prefetch_lists(batch_emb)
 
-            batch_scores, batch_idxs, cluster_min, cluster_lid = self.index.search_with_cluster_id(batch_emb, k=num)
+            if hasattr(self.index, "search_with_cluster_id"):
+                batch_scores, batch_idxs, cluster_min, cluster_lid = self.index.search_with_cluster_id(
+                    batch_emb, k=num
+                )
+            else:
+                batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+                # Fallback placeholders for indices that don't support cluster ids.
+                cluster_min = np.zeros((len(query_batch), 1), dtype=np.float32)
+                cluster_lid = np.zeros((len(query_batch), 1), dtype=np.int64)
 
             if self.return_embedding:
                 profile_search_scores, profile_search_idxs = self.index.search(batch_emb, k=20)
@@ -929,6 +1297,8 @@ class FaissEngine(BaseEngine):
                             self.idxs_cache[idxs] += 1
                         else:
                             self.idxs_cache[idxs] = 1
+
+            self._maybe_post_batch_autofetch_evict(batch_assigned_centroids)
 
         if return_score:
             return results, scores

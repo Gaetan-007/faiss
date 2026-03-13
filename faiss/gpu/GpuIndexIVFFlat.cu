@@ -30,9 +30,156 @@
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <fstream>
+#include <mutex>
+#include <string>
+
+#include <cerrno>
+#include <pwd.h>
 
 namespace faiss {
 namespace gpu {
+
+namespace {
+
+std::string getHomeDirectoryForFaissMissLogger() {
+    const char* homeEnv = std::getenv("HOME");
+    if (homeEnv && homeEnv[0] != '\0') {
+        return std::string(homeEnv);
+    }
+
+    struct passwd* pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0] != '\0') {
+        return std::string(pw->pw_dir);
+    }
+
+    return std::string();
+}
+
+bool ensureDirectoryExistsForFaissMissLogger(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true;
+        }
+        std::fprintf(
+                stderr,
+                "faiss miss logger: path %s exists but is not a directory\n",
+                path.c_str());
+        return false;
+    }
+
+    if (mkdir(path.c_str(), 0755) != 0) {
+        if (errno == EEXIST) {
+            // Race with another process/thread creating the directory
+            return true;
+        }
+        std::fprintf(
+                stderr,
+                "faiss miss logger: mkdir(%s) failed: %s\n",
+                path.c_str(),
+                std::strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+const char* missPolicyToString(IvfListMissPolicy policy) {
+    switch (policy) {
+    case IvfListMissPolicy::Error:
+        return "Error";
+    case IvfListMissPolicy::AutoFetch:
+        return "AutoFetch";
+    case IvfListMissPolicy::CpuOffload:
+        return "CpuOffload";
+    default:
+        return "Unknown";
+    }
+}
+
+void logIvfMiss(
+        const std::vector<idx_t>& missLists,
+        IvfListMissPolicy policy) {
+    if (missLists.empty()) {
+        return;
+    }
+
+    static std::mutex loggerMutex;
+    std::lock_guard<std::mutex> guard(loggerMutex);
+
+    std::string home = getHomeDirectoryForFaissMissLogger();
+    if (home.empty()) {
+        std::fprintf(
+                stderr,
+                "faiss miss logger: failed to determine HOME directory\n");
+        return;
+    }
+
+    std::string dir = home + "/.faiss_log";
+    if (!ensureDirectoryExistsForFaissMissLogger(dir)) {
+        std::fprintf(
+                stderr,
+                "faiss miss logger: failed to create or access log directory %s\n",
+                dir.c_str());
+        return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tmBuf;
+#if defined(_WIN32)
+    if (gmtime_s(&tmBuf, &now_c) != 0) {
+        std::fprintf(stderr, "faiss miss logger: gmtime_s failed\n");
+        return;
+    }
+#else
+    if (!gmtime_r(&now_c, &tmBuf)) {
+        std::fprintf(stderr, "faiss miss logger: gmtime_r failed\n");
+        return;
+    }
+#endif
+
+    char dateBuf[16];
+    if (std::strftime(dateBuf, sizeof(dateBuf), "%y_%m_%d", &tmBuf) == 0) {
+        std::fprintf(stderr, "faiss miss logger: strftime for date failed\n");
+        return;
+    }
+
+    std::string filePath = dir + "/miss_log_" + dateBuf + ".log";
+
+    std::ofstream ofs(filePath.c_str(), std::ios::out | std::ios::app);
+    if (!ofs.is_open()) {
+        std::fprintf(
+                stderr,
+                "faiss miss logger: failed to open log file %s\n",
+                filePath.c_str());
+        return;
+    }
+
+    char timeBuf[32];
+    if (std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%SZ", &tmBuf) ==
+        0) {
+        std::fprintf(stderr, "faiss miss logger: strftime for time failed\n");
+        return;
+    }
+
+    ofs << timeBuf << "," << missLists.size() << ",";
+
+    for (size_t i = 0; i < missLists.size(); ++i) {
+        if (i > 0) {
+            ofs << "|";
+        }
+        ofs << missLists[i];
+    }
+
+    ofs << "," << missPolicyToString(policy) << "\n";
+}
+
+} // namespace
 
 GpuIndexIVFFlat::GpuIndexIVFFlat(
         GpuResourcesProvider* provider,
@@ -763,6 +910,39 @@ void GpuIndexIVFFlat::searchImpl_(
                 coarseDistances.data(),
                 coarseIndices.data());
 
+        // Per-query miss logging: for each query, record which IVF lists are
+        // currently backed only by CPU (GPU miss) under the AutoFetch policy.
+        if (!cpuListCache_.empty()) {
+            for (idx_t i = 0; i < n; ++i) {
+                std::vector<idx_t> perQueryMiss;
+                perQueryMiss.reserve(use_nprobe);
+
+                for (int p = 0; p < use_nprobe; ++p) {
+                    size_t pos =
+                            (size_t)i * (size_t)use_nprobe + (size_t)p;
+                    idx_t key = coarseIndices[pos];
+
+                    if (key < 0 || key >= nlist) {
+                        continue;
+                    }
+
+                    if (cpuListCache_.find(key) != cpuListCache_.end()) {
+                        perQueryMiss.push_back(key);
+                    }
+                }
+
+                if (!perQueryMiss.empty()) {
+                    std::sort(perQueryMiss.begin(), perQueryMiss.end());
+                    perQueryMiss.erase(
+                            std::unique(
+                                    perQueryMiss.begin(),
+                                    perQueryMiss.end()),
+                            perQueryMiss.end());
+                    logIvfMiss(perQueryMiss, IvfListMissPolicy::AutoFetch);
+                }
+            }
+        }
+
         // Deduplicate the list IDs we need to access
         std::unordered_set<idx_t> uniqueListIds(
                 coarseIndices.begin(), coarseIndices.end());
@@ -823,6 +1003,10 @@ void GpuIndexIVFFlat::searchImpl_(
         std::vector<idx_t> assignGpu(totalProbes, (idx_t)-1);
         std::vector<idx_t> assignCpu(totalProbes, (idx_t)-1);
 
+        // Track per-query miss lists (handled on CPU due to eviction).
+        std::vector<std::vector<idx_t>> perQueryMiss;
+        perQueryMiss.resize((size_t)n);
+
         bool hasGpuLists = false;
         bool hasCpuLists = false;
 
@@ -852,6 +1036,7 @@ void GpuIndexIVFFlat::searchImpl_(
                 } else if (inCpuCache) {
                     assignCpu[pos] = key;
                     hasCpuLists = true;
+                    perQueryMiss[(size_t)i].push_back(key);
                 } else {
                     FAISS_THROW_IF_NOT_MSG(
                             false,
@@ -914,6 +1099,21 @@ void GpuIndexIVFFlat::searchImpl_(
                     /*store_pairs=*/false,
                     &baseParams,
                     /*stats=*/nullptr);
+        }
+
+        // Emit per-query miss logs for CpuOffload policy.
+        if (hasCpuLists) {
+            for (idx_t i = 0; i < n; ++i) {
+                auto& missLists = perQueryMiss[(size_t)i];
+                if (missLists.empty()) {
+                    continue;
+                }
+                std::sort(missLists.begin(), missLists.end());
+                missLists.erase(
+                        std::unique(missLists.begin(), missLists.end()),
+                        missLists.end());
+                logIvfMiss(missLists, IvfListMissPolicy::CpuOffload);
+            }
         }
 
         // Merge GPU and CPU results per query on the CPU.

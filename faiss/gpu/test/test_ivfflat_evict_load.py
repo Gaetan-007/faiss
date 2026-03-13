@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import numpy as np
 import faiss
 import pytest
@@ -184,3 +187,66 @@ def test_auto_fetch_with_all_lists_evicted():
     assert np.array_equal(I_baseline, I_result), "Results should match baseline"
 
     faiss.set_auto_fetch(gpu_index, False)
+
+
+def test_auto_fetch_miss_logging(tmp_path, monkeypatch):
+    d = 64
+    nb = 5000
+    nq = 20
+    nlist = 50
+    k = 5
+
+    # Isolate log output under a temporary HOME directory
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    rng = np.random.RandomState(321)
+    xb = rng.random((nb, d)).astype("float32")
+    xq = rng.random((nq, d)).astype("float32")
+
+    cpu_index = _build_cpu_ivfflat_index(
+        xb=xb,
+        d=d,
+        nlist=nlist,
+        metric=faiss.METRIC_L2,
+        nprobe=5,
+    )
+    gpu_index = _to_gpu(cpu_index, 0)
+
+    # Ensure there are IVF lists touched by this workload.
+    unique_list_ids = _unique_list_ids(cpu_index, xq, gpu_index.nprobe)
+    if unique_list_ids.size == 0:
+        pytest.skip("No IVF lists are used by this query workload")
+
+    # Evict all probed lists so that subsequent search under AutoFetch policy
+    # will need to load them back from CPU and be logged as misses.
+    faiss.evict_ivf_lists(gpu_index, unique_list_ids)
+
+    faiss.set_auto_fetch(gpu_index, True)
+    assert faiss.is_auto_fetch_enabled(gpu_index)
+
+    # Trigger a search; this should cause AutoFetch to load missing lists and
+    # emit miss logs for the queries whose probed lists are evicted.
+    gpu_index.search(xq, k)
+
+    log_dir = fake_home / ".faiss_log"
+    assert log_dir.is_dir(), "miss log directory was not created"
+
+    log_files = sorted(log_dir.glob("miss_log_*.log"))
+    assert log_files, "no miss log file created for AutoFetch policy"
+
+    latest = log_files[-1]
+    lines = latest.read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "miss log file is empty"
+
+    last = lines[-1]
+    parts = last.split(",")
+    assert len(parts) == 4, f"unexpected log line format: {last!r}"
+
+    # Format: timestamp, miss_count, miss_centroids, policy
+    timestamp, miss_count_str, miss_centroids_str, policy_str = parts
+    assert policy_str == "AutoFetch"
+    miss_count = int(miss_count_str)
+    assert miss_count > 0
+    assert miss_centroids_str, "miss centroid list should not be empty"
