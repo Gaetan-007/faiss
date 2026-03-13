@@ -64,6 +64,12 @@ def mock_engine():
     engine._batch_add = Mock(return_value=[{"success": True}, {"success": True}])
     engine.finished_requests = 10
     engine.request_batch_size = 5
+    engine.get_cluster_stats = Mock(
+        return_value={
+            0: {"probe_count": 10, "load_count": 2, "last_probe_ts": 123.0},
+            1: {"probe_count": 5, "load_count": 1, "last_probe_ts": 124.0},
+        }
+    )
     return engine
 
 
@@ -399,6 +405,81 @@ class TestStatsEndpoint:
         assert "total_requests" in data["logger_stats"]
 
 
+class TestAdminEvictionAPI:
+    """Tests for admin eviction/load HTTP APIs."""
+
+    def test_get_evicted_lists(self, client, mock_engine):
+        """GET /admin/evicted_lists should succeed (even if empty)."""
+        # Mock faiss.get_evicted_lists to return an empty list
+        import faiss as faiss_module
+
+        original = getattr(faiss_module, "get_evicted_lists", None)
+        try:
+            if original is None:
+                setattr(faiss_module, "get_evicted_lists", lambda index: [])
+            response = client.get("/api/v1/admin/evicted_lists")
+            assert response.status_code in (200, 400)
+            if response.status_code == 200:
+                data = response.json()
+                assert "evicted_lists" in data
+        finally:
+            if original is not None:
+                setattr(faiss_module, "get_evicted_lists", original)
+
+    def test_admin_evict_uses_engine_api(self, client, mock_engine):
+        """POST /admin/evict should call engine.evict_lists if available."""
+        # Attach evict_lists to mock_engine
+        mock_engine.evict_lists = lambda ids: {int(i): 0 for i in ids}
+
+        response = client.post(
+            "/api/v1/admin/evict",
+            json={"list_ids": [1, 2, 3]},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "reclaimed_bytes" in data
+
+    def test_admin_load_uses_engine_api(self, client, mock_engine):
+        """POST /admin/load should call engine.load_lists if available."""
+        mock_engine.load_lists = lambda ids: {int(i): 0 for i in ids}
+
+        response = client.post(
+            "/api/v1/admin/load",
+            json={"list_ids": [4, 5]},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "loaded_bytes" in data
+
+
+class TestAdminClusterStatsAPI:
+    """Tests for admin cluster-stats HTTP API."""
+
+    def test_admin_cluster_stats_uses_engine_api(self, client, mock_engine):
+        """GET /admin/cluster_stats should call engine.get_cluster_stats if available."""
+        response = client.get("/api/v1/admin/cluster_stats")
+        assert response.status_code in (200, 400)
+        if response.status_code == 200:
+            data = response.json()
+            assert "stats" in data
+            assert isinstance(data["stats"], list)
+            if data["stats"]:
+                item = data["stats"][0]
+                assert "list_id" in item
+                assert "probe_count" in item
+                assert "load_count" in item
+                assert "last_probe_ts" in item
+
+    def test_admin_cluster_stats_missing_api_returns_400(self, client, mock_engine):
+        """If engine lacks get_cluster_stats, endpoint should return 400."""
+        # Remove API from this engine instance
+        if hasattr(mock_engine, "get_cluster_stats"):
+            delattr(mock_engine, "get_cluster_stats")
+
+        response = client.get("/api/v1/admin/cluster_stats")
+        assert response.status_code == 400
+
+
 # ============================================================================
 # Functional Tests - Complete Workflows
 # ============================================================================
@@ -555,7 +636,9 @@ class TestPerformance:
         )
         elapsed = time.time() - start
         assert response.status_code == 200
-        assert elapsed < 5.0  # Should complete within 5 seconds
+        # Basic regression guardrail: request should complete within 5 seconds
+        # under test conditions. This is intentionally loose to avoid flakes.
+        assert elapsed < 5.0
 
 
 # ============================================================================

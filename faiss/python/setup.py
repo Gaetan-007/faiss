@@ -39,10 +39,13 @@ if os.path.exists(utils_src):
 
 has_engine = os.path.exists(os.path.join(setup_dir, "engine"))
 has_server = os.path.exists(os.path.join(setup_dir, "server"))
+has_cli = os.path.exists(os.path.join(setup_dir, "cli"))
 if has_engine:
     shutil.copytree(os.path.join(setup_dir, "engine"), "faiss/engine")
 if has_server:
     shutil.copytree(os.path.join(setup_dir, "server"), "faiss/server")
+if has_cli:
+    shutil.copytree(os.path.join(setup_dir, "cli"), "faiss/cli")
 
 if platform.system() != "AIX":
     ext = ".pyd" if platform.system() == "Windows" else ".so"
@@ -160,6 +163,8 @@ if has_engine:
     packages_list.append("faiss.engine")
 if has_server:
     packages_list.append("faiss.server")
+if has_cli:
+    packages_list.append("faiss.cli")
 
 setup(
     name="faiss",
@@ -178,4 +183,9 @@ setup(
         "faiss": ["*.so", "*.pyd", "*.a"],
     },
     zip_safe=False,
+    entry_points={
+        "console_scripts": [
+            "faissctl=faiss.cli.main:main",
+        ],
+    } if has_cli else {},
 )

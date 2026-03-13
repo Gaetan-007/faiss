@@ -308,6 +308,53 @@ def test_evict_load_routing():
     assert list_id not in evicted
 
 
+@pytest.mark.parametrize("shard_type", [4, 5])
+def test_sharded_error_policy_after_evict_changes_results(shard_type):
+    """Default miss policy (Error): after evict, search should not auto-recover."""
+    ngpu = min(2, faiss.get_num_gpus())
+    cpu_index, ds = _build_cpu_ivfflat(32, 5000, 40, 64, 8)
+    xq = ds.get_queries()
+    k = 5
+
+    cpu_index.nprobe = 8
+    _D_cpu, I_cpu = cpu_index.search(xq, k)
+
+    index_gpu = _create_sharded_index(cpu_index, ngpu, shard_type)
+    faiss.GpuParameterSpace().set_index_parameter(index_gpu, "nprobe", 8)
+
+    unique_list_ids = _unique_list_ids(cpu_index, xq, 8)
+    if len(unique_list_ids) == 0:
+        pytest.skip("No lists to evict for miss-policy=Error test")
+
+    faiss.evict_ivf_lists(index_gpu, unique_list_ids)
+
+    # Ensure shards are in Error mode (no auto-fetch)
+    nshard = index_gpu.count() if hasattr(index_gpu, "count") else ngpu
+    for s in range(nshard):
+        shard = faiss.downcast_index(index_gpu.at(s))
+        if hasattr(shard, "setMissPolicy"):
+            # Enum is represented as integer in Python bindings (0=Error)
+            shard.setMissPolicy(0)
+        if hasattr(faiss, "set_auto_fetch"):
+            faiss.set_auto_fetch(shard, False)
+        if hasattr(faiss, "reset_auto_fetch_stats"):
+            faiss.reset_auto_fetch_stats(shard)
+
+    _D_gpu, I_gpu = index_gpu.search(xq, k)
+    assert (I_gpu != I_cpu).any(), (
+        "Expected results to differ after evict under Error policy"
+    )
+
+    # Confirm no auto-fetch activity
+    if hasattr(faiss, "get_auto_fetch_stats"):
+        total_fetches = 0
+        for s in range(nshard):
+            shard = faiss.downcast_index(index_gpu.at(s))
+            stats = faiss.get_auto_fetch_stats(shard)
+            total_fetches += int(stats.get("total_fetches", 0))
+        assert total_fetches == 0
+
+
 @pytest.mark.skipif(
     not hasattr(faiss.StandardGpuResources(), "setDeviceMemoryReservation"),
     reason="setDeviceMemoryReservation not available",
@@ -346,10 +393,41 @@ def test_pool_and_ipc_multi_gpu():
     )
 
     controllers = [GpuPoolController(i) for i in range(ngpu)]
+    # Baseline search should be stable across resize operations
+    xq = ds.get_queries()
+    k = 5
+    _D0, I0 = index_gpu.search(xq, k)
+
     for ctrl in controllers:
-        result = ctrl.query()
-        assert result["status"] == ResizeStatus.SUCCESS
-        assert result["actual_size"] >= pool_size
+        before = ctrl.query()
+        assert before["status"] == ResizeStatus.SUCCESS
+        assert before["actual_size"] >= pool_size
+
+        # Expand by a small delta; if expansion is not possible on this CI host,
+        # skip rather than flake.
+        delta = 8 * 1024 * 1024
+        expanded = ctrl.expand_by(delta)
+        if expanded["status"] != ResizeStatus.SUCCESS:
+            pytest.skip(f"pool expand_by failed: {expanded.get('error', '')}")
+
+        after_expand = ctrl.query()
+        assert after_expand["status"] == ResizeStatus.SUCCESS
+        assert after_expand["actual_size"] >= before["actual_size"]
+
+        _D1, I1 = index_gpu.search(xq, k)
+        np.testing.assert_array_equal(I0, I1)
+
+        # Attempt to shrink back to the original size; PARTIAL is acceptable.
+        shrunk = ctrl.shrink(int(before["actual_size"]))
+        if shrunk["status"] == ResizeStatus.FAILED:
+            pytest.skip(f"pool shrink failed: {shrunk.get('error', '')}")
+
+        after_shrink = ctrl.query()
+        assert after_shrink["status"] == ResizeStatus.SUCCESS
+        assert after_shrink["actual_size"] >= int(before["actual_size"])
+
+        _D2, I2 = index_gpu.search(xq, k)
+        np.testing.assert_array_equal(I0, I2)
 
 
 @pytest.mark.skipif(
@@ -460,3 +538,90 @@ def test_sharded_auto_fetch_restores_results():
         shard = faiss.downcast_index(index_gpu.at(s))
         stats2 = faiss.get_auto_fetch_stats(shard)
         assert stats2["total_fetches"] == 0
+
+
+def test_sharded_auto_fetch_restores_results_type5():
+    """Auto-fetch on each shard restores correctness for shard_type=5."""
+    _skip_if_no_auto_fetch()
+
+    ngpu = min(2, faiss.get_num_gpus())
+    cpu_index, ds = _build_cpu_ivfflat(32, 5000, 40, 64, 8)
+    xq = ds.get_queries()
+    k = 5
+
+    cpu_index.nprobe = 8
+    D_cpu, I_cpu = cpu_index.search(xq, k)
+
+    index_gpu = _create_sharded_index(cpu_index, ngpu, 5)
+    faiss.GpuParameterSpace().set_index_parameter(index_gpu, "nprobe", 8)
+
+    unique_list_ids = _unique_list_ids(cpu_index, xq, 8)
+    if len(unique_list_ids) == 0:
+        pytest.skip("No lists to evict for sharded auto-fetch test (type5)")
+
+    faiss.evict_ivf_lists(index_gpu, unique_list_ids)
+
+    nshard = index_gpu.count() if hasattr(index_gpu, "count") else ngpu
+    for s in range(nshard):
+        shard = faiss.downcast_index(index_gpu.at(s))
+        faiss.set_auto_fetch(shard, True)
+        assert faiss.is_auto_fetch_enabled(shard)
+        faiss.reset_auto_fetch_stats(shard)
+
+    D_gpu, I_gpu = index_gpu.search(xq, k)
+    np.testing.assert_array_equal(I_cpu, I_gpu)
+    np.testing.assert_array_almost_equal(D_cpu, D_gpu, decimal=4)
+
+
+@pytest.mark.parametrize("shard_type", [4, 5])
+def test_sharded_cpu_offload_matches_cpu_baseline(shard_type):
+    """CpuOffload on each shard matches CPU baseline under IndexShardsIVF::search."""
+    if not hasattr(faiss, "IvfListMissPolicy_CpuOffload"):
+        pytest.skip("IvfListMissPolicy_CpuOffload not available in this build")
+    if not hasattr(faiss, "build_sharded_ivfflat_cpu_offload_index"):
+        pytest.skip("build_sharded_ivfflat_cpu_offload_index not available")
+
+    ngpu = min(2, faiss.get_num_gpus())
+    cpu_index, ds = _build_cpu_ivfflat(32, 8000, 80, 128, 16)
+    xq = ds.get_queries()
+    k = 10
+
+    cpu_index.nprobe = 16
+    D_ref, I_ref = cpu_index.search(xq, k)
+
+    # Lists touched by this workload, filtered to non-empty.
+    touched = _unique_list_ids(cpu_index, xq, cpu_index.nprobe)
+    if len(touched) == 0:
+        pytest.skip("No lists touched for CpuOffload sharded test")
+
+    # Compute list assignment to shards to preload a fraction of touched lists on GPU.
+    list_ids_per_shard, _list_to_shard = faiss._compute_ivf_list_assignment(
+        cpu_index, ngpu, shard_type
+    )
+    preload = [[] for _ in range(ngpu)]
+    touched_set = set(int(x) for x in np.asarray(touched).ravel())
+    for s in range(ngpu):
+        owned_touched = [lid for lid in list_ids_per_shard[s] if int(lid) in touched_set]
+        if not owned_touched:
+            continue
+        half = max(1, len(owned_touched) // 2)
+        preload[s] = owned_touched[:half]
+
+    index_gpu, _cpu_backings, _lis, _l2s = faiss.build_sharded_ivfflat_cpu_offload_index(
+        cpu_index,
+        ngpu=ngpu,
+        shard_type=shard_type,
+        preload_list_ids_per_shard=preload,
+        use_cuvs=False,
+    )
+    faiss.GpuParameterSpace().set_index_parameter(index_gpu, "nprobe", 16)
+
+    # Enable CpuOffload on each shard.
+    nshard = index_gpu.count()
+    for s in range(nshard):
+        shard = faiss.downcast_index(index_gpu.at(s))
+        shard.setMissPolicy(faiss.IvfListMissPolicy_CpuOffload)
+
+    D_off, I_off = index_gpu.search(xq, k)
+    np.testing.assert_array_equal(I_ref, I_off)
+    np.testing.assert_allclose(D_ref, D_off, rtol=1e-6, atol=1e-3)

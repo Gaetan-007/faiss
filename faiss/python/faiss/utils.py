@@ -94,9 +94,6 @@ def read_jsonl(file_path):
 
 
 def load_corpus(corpus_path: str):
-    # Support both HuggingFace datasets and local JSON/JSONL files
-    if corpus_path.endswith('.json') or corpus_path.endswith('.jsonl'):
-        return datasets.load_dataset('json', data_files=corpus_path, split="train")
     return datasets.load_dataset(corpus_path, split="train")
 
 

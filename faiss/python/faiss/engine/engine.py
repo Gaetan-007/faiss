@@ -604,13 +604,6 @@ class FaissEngine(BaseEngine):
         if len(devices) == 1:
             dev = int(devices[0])
             res = faiss.StandardGpuResources()
-            # Enable GPU memory pool IPC for pool control commands
-            if hasattr(res, "setDeviceMemoryReservation"):
-                mem_size = int(8 * 1024 * 1024 * 1024)  # 8GB default
-                try:
-                    res.setDeviceMemoryReservation(mem_size)
-                except Exception:
-                    pass  # Memory reservation is optional
             try:
                 self.index = faiss.index_cpu_to_gpu(res, dev, cpu_index)
             except Exception as exc:
@@ -1075,33 +1068,17 @@ class FaissEngine(BaseEngine):
         strategy-dependent order and attempts to load them until the GPU memory
         pool can no longer accommodate additional lists.
         """
-        # #region agent log - _initialize_gpu_ivf_lists
-        import json, time as _time
-        _log_path = "/home/wangzehao/projects/faiss/.cursor/debug-3a22cd.log"
-        def _log(h, m, d=None):
-            try:
-                with open(_log_path, "a") as f:
-                    f.write(json.dumps({"sessionId":"3a22cd","runId":"debug","hypothesisId":h,"location":"engine.py:_initialize_gpu_ivf_lists","message":m,"data":d or {},"timestamp":int(_time.time()*1000)}) + "\n")
-            except: pass
-        # #endregion
         strategy = str(getattr(config, "gpu_ivf_init_strategy", "none")).strip().lower()
-        _log("E", "_initialize_gpu_ivf_lists entry", {"strategy": strategy})
         if strategy in {"", "none", "disabled"}:
-            _log("E", "Strategy is none/disabled, returning", {})
             return
-        supports_eviction = self._supports_gpu_eviction()
-        _log("E", "Checking eviction support", {"supports_gpu_eviction": supports_eviction})
-        if not supports_eviction:
-            _log("E", "GPU eviction not supported", {"index_type": type(self.index).__name__, "has_isListOnGpu": hasattr(self.index, "isListOnGpu"), "has_loadCentroidToGpu": hasattr(self.index, "loadCentroidToGpu")})
+        if not self._supports_gpu_eviction():
             raise EngineError(
                 "gpu_ivf_init_strategy requires a GPU IVF index with eviction support"
             )
         if not hasattr(self.index, "nlist"):
-            _log("E", "Index has no nlist", {})
             raise EngineError("gpu_ivf_init_strategy requires an IVF index with nlist")
 
         nlist = int(getattr(self.index, "nlist", 0))
-        _log("E", "IVF list info", {"nlist": nlist})
         if nlist <= 0:
             return
 
@@ -1111,14 +1088,11 @@ class FaissEngine(BaseEngine):
             rng = np.random.default_rng()
             rng.shuffle(candidate_ids)
         elif strategy == "largest":
-            _log("E", "Using 'largest' strategy", {})
             try:
                 cluster_sizes = self.index.get_cluster_size_heterag(
                     [range(0, nlist)]
                 )[0]
-                _log("E", "Got cluster sizes", {"cluster_sizes_len": len(cluster_sizes)})
             except Exception as exc:
-                _log("E", "Failed to get cluster sizes", {"error": str(exc)})
                 raise EngineError(
                     "gpu_ivf_init_strategy='largest' requires "
                     "index.get_cluster_size_heterag support"
@@ -1129,11 +1103,9 @@ class FaissEngine(BaseEngine):
                 if int(cluster_sizes[i]) > 0
             ]
             if not sized:
-                _log("E", "No clusters with size > 0", {})
                 return
             sized.sort(key=lambda x: x[1], reverse=True)
             candidate_ids = [lid for (lid, _) in sized]
-            _log("E", "Largest strategy candidates", {"count": len(candidate_ids), "top5": candidate_ids[:5]})
         elif strategy == "frequency":
             stats_path = Path(__file__).resolve().parent / "config" / "default.json"
             try:
@@ -1162,24 +1134,18 @@ class FaissEngine(BaseEngine):
 
         protected: set = set()
         loaded = 0
-        _log("E", "Starting to load IVF lists", {"candidate_count": len(candidate_ids)})
         for lid in candidate_ids:
             protected.add(int(lid))
             try:
                 self._load_list_with_eviction(int(lid), protected)
                 loaded += 1
-                if loaded <= 5 or loaded % 100 == 0:
-                    _log("E", "Loaded IVF list", {"lid": lid, "loaded_count": loaded})
-            except EvictionPolicyError as epe:
+            except EvictionPolicyError:
                 # We reached the practical capacity of the GPU memory pool.
-                _log("E", "EvictionPolicyError - reached GPU memory capacity", {"lid": lid, "loaded": loaded, "error": str(epe)})
                 break
             except Exception as exc:
-                _log("E", "Failed to load IVF list", {"lid": lid, "error": str(exc)})
                 raise EngineError(
                     f"failed to initialize IVF list {lid} on GPU"
                 ) from exc
-        _log("E", "Finished loading IVF lists", {"total_loaded": loaded})
 
     def _evict_one_list(self, protected: set) -> Optional[int]:
         # Prefer backend-driven policy when available.
@@ -1631,11 +1597,3 @@ class FaissEngine(BaseEngine):
 
     def show_time_profile(self):
         print("Not implemented")
-
-    def _add(self, query: str, return_centroid: bool = False, retrain: bool = False):
-        """Add a document to the index. Not implemented."""
-        raise NotImplementedError("_add is not implemented in FaissEngine")
-
-    def _batch_add(self, query_list, return_centroid: bool = False, retrain: bool = False):
-        """Batch add documents to the index. Not implemented."""
-        raise NotImplementedError("_batch_add is not implemented in FaissEngine")

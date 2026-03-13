@@ -125,6 +125,21 @@ class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
 
     void reconstruct_n(idx_t i0, idx_t n, float* out) const override;
 
+    /// Override preassigned search to apply miss-policy behavior (AutoFetch /
+    /// CpuOffload) in multi-index contexts such as IndexShardsIVF that call
+    /// search_preassigned directly.
+    void search_preassigned(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            const idx_t* assign,
+            const float* centroid_dis,
+            float* distances,
+            idx_t* labels,
+            bool store_pairs,
+            const SearchParametersIVF* params = nullptr,
+            IndexIVFStats* stats = nullptr) const override;
+
     /// Configure how IVF list misses (for probed lists) are handled during
     /// search. See IvfListMissPolicy for details.
     ///
@@ -187,6 +202,15 @@ class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
 
     /// Get the set of lists that are currently evicted (in CPU cache)
     std::vector<idx_t> getEvictedLists() const override;
+
+    /// Return per-list activation statistics as a flat vector:
+    /// [list_id0, probe_count0, load_count0, last_probe_ts0,
+    ///  list_id1, probe_count1, load_count1, last_probe_ts1, ...]
+    /// Timestamps are monotonic but otherwise implementation-defined.
+    std::vector<uint64_t> getActivationStatsFlatVector() const;
+
+    /// Reset all per-list activation statistics to zero.
+    void resetActivationStats();
 
     /// Get statistics about auto-fetch operations (for debugging/profiling)
     struct AutoFetchStats {
@@ -294,6 +318,27 @@ class GpuIndexIVFFlat : public GpuIndexIVF, public IVFEvictLoadInterface {
 
     /// Statistics for auto-fetch operations
     mutable AutoFetchStats autoFetchStats_ = {0, 0, 0};
+
+    /// Internal helper to (re)initialize activation statistics storage.
+    void initActivationStats_();
+
+    /// Internal helpers to record per-list probe/load events.
+    void recordListProbe_(idx_t listId);
+    void recordListLoad_(idx_t listId);
+
+    struct ListActivationCounters {
+        std::atomic<uint64_t> probeCount;
+        std::atomic<uint64_t> loadCount;
+        std::atomic<uint64_t> lastProbeTs;
+
+        ListActivationCounters()
+                : probeCount(0), loadCount(0), lastProbeTs(0) {}
+
+        ListActivationCounters(const ListActivationCounters&) = delete;
+        ListActivationCounters& operator=(const ListActivationCounters&) = delete;
+    };
+
+    std::unique_ptr<ListActivationCounters[]> listActivationStats_;
 
     static constexpr uint32_t kIpcMagic = 0x4956464c; // "IVFL"
     static constexpr uint32_t kIpcVersion = 1;

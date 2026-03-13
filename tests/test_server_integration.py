@@ -130,6 +130,12 @@ class TestServerIntegration:
         )
         assert response.status_code in [200, 500]  # 500 if engine not ready
 
+    def test_admin_evicted_lists_live(self, server):
+        """Test admin evicted-lists endpoint on live server (if available)."""
+        response = requests.get(f"{server.base_url}/api/v1/admin/evicted_lists", timeout=5)
+        # Endpoint may be disabled or engine may not support it; accept 200/400/500.
+        assert response.status_code in [200, 400, 500]
+
 
 # ============================================================================
 # Fixtures

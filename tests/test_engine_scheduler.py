@@ -1,4 +1,84 @@
 import time
+
+import pytest
+
+from faiss.engine.scheduler import (
+    SchedulerRequest,
+    FifoScheduler,
+    RoundRobinScheduler,
+    PriorityScheduler,
+)
+
+
+class _DummyFuture:
+    def __init__(self):
+        self._result = None
+
+    def set_result(self, value):
+        self._result = value
+
+
+def _make_request(source_id: str, enqueue_time: float) -> SchedulerRequest:
+    return SchedulerRequest(
+        id=f"{source_id}-{enqueue_time}",
+        query="q",
+        num=10,
+        return_score=False,
+        enqueue_time=enqueue_time,
+        source_id=source_id,
+        future=_DummyFuture(),
+    )
+
+
+def test_priority_scheduler_orders_by_priority_then_time():
+    now = time.monotonic()
+    sched = PriorityScheduler(
+        max_batch_size=10,
+        max_wait_ms=0,
+        step_interval_ms=0,
+        source_priorities={"high": 10, "low": 0},
+        default_priority=0,
+    )
+
+    # enqueue: low (t0), high (t1), low (t2)
+    r1 = _make_request("low", now)
+    r2 = _make_request("high", now + 0.001)
+    r3 = _make_request("low", now + 0.002)
+
+    sched.add_request(r1)
+    sched.add_request(r2)
+    sched.add_request(r3)
+
+    assert sched.pending_count() == 3
+
+    # step should pick high-priority first, regardless of time
+    batch = sched._pop_batch(now + 1.0, 3)
+    assert [r.source_id for r in batch] == ["high", "low", "low"]
+
+
+def test_priority_scheduler_respects_default_priority_and_fifo():
+    now = time.monotonic()
+    sched = PriorityScheduler(
+        max_batch_size=10,
+        max_wait_ms=0,
+        step_interval_ms=0,
+        source_priorities={"vip": 5},
+        default_priority=1,
+    )
+
+    r1 = _make_request("userA", now)
+    r2 = _make_request("vip", now + 0.001)
+    r3 = _make_request("userB", now + 0.002)
+
+    sched.add_request(r1)
+    sched.add_request(r2)
+    sched.add_request(r3)
+
+    batch = sched._pop_batch(now + 1.0, 3)
+    # vip (prio 5) first, then userA (prio 1, earlier), then userB
+    assert [r.source_id for r in batch] == ["vip", "userA", "userB"]
+
+import time
 from concurrent.futures import Future
 
 import pytest
@@ -44,7 +124,7 @@ class DummyEngine(BaseEngine):
         raise NotImplementedError("DummyEngine does not support batch add")
 
 
-def _make_request(req_id: str, query: str, source_id: str) -> SchedulerRequest:
+def _make_engine_request(req_id: str, query: str, source_id: str) -> SchedulerRequest:
     return SchedulerRequest(
         id=req_id,
         query=query,
@@ -58,8 +138,8 @@ def _make_request(req_id: str, query: str, source_id: str) -> SchedulerRequest:
 
 def test_fifo_scheduler_batches_in_order():
     scheduler = FifoScheduler(max_batch_size=2, max_wait_ms=0, step_interval_ms=0)
-    scheduler.add_request(_make_request("r1", "q1", "s1"))
-    scheduler.add_request(_make_request("r2", "q2", "s1"))
+    scheduler.add_request(_make_engine_request("r1", "q1", "s1"))
+    scheduler.add_request(_make_engine_request("r2", "q2", "s1"))
 
     assert scheduler.should_step() is True
     batch = scheduler.step()
@@ -68,9 +148,9 @@ def test_fifo_scheduler_batches_in_order():
 
 def test_round_robin_scheduler_rotates_sources():
     scheduler = RoundRobinScheduler(max_batch_size=3, max_wait_ms=0, step_interval_ms=0)
-    scheduler.add_request(_make_request("a1", "q1", "A"))
-    scheduler.add_request(_make_request("a2", "q2", "A"))
-    scheduler.add_request(_make_request("b1", "q3", "B"))
+    scheduler.add_request(_make_engine_request("a1", "q1", "A"))
+    scheduler.add_request(_make_engine_request("a2", "q2", "A"))
+    scheduler.add_request(_make_engine_request("b1", "q3", "B"))
 
     batch = scheduler.step()
     assert [req.id for req in batch] == ["a1", "b1", "a2"]

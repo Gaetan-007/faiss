@@ -28,3 +28,4 @@ faiss/python/swigfaiss_sve.swig
 .vscode/
 *.png
 /docs/
+reference/

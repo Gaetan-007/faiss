@@ -704,6 +704,15 @@ std::vector<uint64_t> GpuIndexIVFFlat_getAutoFetchStatsVector(
     out.push_back(stats.totalBytesFetched);
     return out;
 }
+
+std::vector<uint64_t> GpuIndexIVFFlat_getActivationStatsVector(
+        const faiss::gpu::GpuIndexIVFFlat* index) {
+    if (!index) {
+        throw std::runtime_error(
+                "GpuIndexIVFFlat_getActivationStatsVector: index is null");
+    }
+    return index->getActivationStatsFlatVector();
+}
 %}
 
 %include  <faiss/gpu/GpuIndexIVFScalarQuantizer.h>

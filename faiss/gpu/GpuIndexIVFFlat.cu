@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -53,6 +54,7 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
     if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
         autoFetchEnabled_ = true;
     }
+    initActivationStats_();
     copyFrom(index);
 }
 
@@ -69,6 +71,7 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
     if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
         autoFetchEnabled_ = true;
     }
+    initActivationStats_();
     // We haven't trained ourselves, so don't construct the IVFFlat
     // index yet
 }
@@ -94,6 +97,7 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(
     if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
         autoFetchEnabled_ = true;
     }
+    initActivationStats_();
     // We could have been passed an already trained coarse quantizer. There is
     // no other quantizer that we need to train, so this is sufficient
     if (this->is_trained) {
@@ -172,6 +176,8 @@ void GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
 
     // Copy all of the IVF data
     index_->copyInvertedListsFrom(index->invlists);
+
+    initActivationStats_();
 }
 
 void GpuIndexIVFFlat::copyFromSelective(
@@ -273,6 +279,8 @@ void GpuIndexIVFFlat::copyFromSelective(
             cpuListCache_.emplace(listId, std::move(cache));
         }
     }
+
+    initActivationStats_();
 }
 
 void GpuIndexIVFFlat::copyTo(faiss::IndexIVFFlat* index) const {
@@ -315,6 +323,9 @@ void GpuIndexIVFFlat::reset() {
     } else {
         FAISS_ASSERT(this->ntotal == 0);
     }
+
+    // Clearing inverted lists also logically clears per-list activation stats.
+    initActivationStats_();
 }
 
 void GpuIndexIVFFlat::updateQuantizer() {
@@ -501,6 +512,10 @@ size_t GpuIndexIVFFlat::loadCentroidToGpu(idx_t listId) {
 
     cpuListCache_.erase(it);
 
+    if (bytesLoaded > 0) {
+        recordListLoad_(listId);
+    }
+
     return bytesLoaded;
 }
 
@@ -670,6 +685,80 @@ std::vector<idx_t> GpuIndexIVFFlat::getEvictedLists() const {
     return evicted;
 }
 
+void GpuIndexIVFFlat::initActivationStats_() {
+    listActivationStats_.reset();
+    if (nlist <= 0) {
+        return;
+    }
+    auto* raw = new ListActivationCounters[static_cast<size_t>(nlist)];
+    for (idx_t i = 0; i < nlist; ++i) {
+        raw[static_cast<size_t>(i)].probeCount.store(
+                0, std::memory_order_relaxed);
+        raw[static_cast<size_t>(i)].loadCount.store(
+                0, std::memory_order_relaxed);
+        raw[static_cast<size_t>(i)].lastProbeTs.store(
+                0, std::memory_order_relaxed);
+    }
+    listActivationStats_.reset(raw);
+}
+
+namespace {
+inline uint64_t getCurrentTimeMillis() {
+    using clock = std::chrono::steady_clock;
+    auto now = clock::now().time_since_epoch();
+    return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+} // namespace
+
+void GpuIndexIVFFlat::recordListProbe_(idx_t listId) {
+    if (listId < 0 || listId >= nlist) {
+        return;
+    }
+    if (!listActivationStats_) {
+        return;
+    }
+    auto& counters = listActivationStats_[static_cast<size_t>(listId)];
+    counters.probeCount.fetch_add(1, std::memory_order_relaxed);
+    auto ts = getCurrentTimeMillis();
+    counters.lastProbeTs.store(ts, std::memory_order_relaxed);
+}
+
+void GpuIndexIVFFlat::recordListLoad_(idx_t listId) {
+    if (listId < 0 || listId >= nlist) {
+        return;
+    }
+    if (!listActivationStats_) {
+        return;
+    }
+    auto& counters = listActivationStats_[static_cast<size_t>(listId)];
+    counters.loadCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::vector<uint64_t> GpuIndexIVFFlat::getActivationStatsFlatVector() const {
+    std::vector<uint64_t> out;
+    if (nlist <= 0 || !listActivationStats_) {
+        return out;
+    }
+    auto* raw = listActivationStats_.get();
+    out.reserve(static_cast<size_t>(nlist) * 4);
+    for (idx_t listId = 0; listId < nlist; ++listId) {
+        const auto& counters = raw[static_cast<size_t>(listId)];
+        out.push_back(static_cast<uint64_t>(listId));
+        out.push_back(
+                counters.probeCount.load(std::memory_order_relaxed));
+        out.push_back(
+                counters.loadCount.load(std::memory_order_relaxed));
+        out.push_back(
+                counters.lastProbeTs.load(std::memory_order_relaxed));
+    }
+    return out;
+}
+
+void GpuIndexIVFFlat::resetActivationStats() {
+    initActivationStats_();
+}
+
 GpuIndexIVFFlat::AutoFetchStats GpuIndexIVFFlat::getAutoFetchStats() const {
     return autoFetchStats_;
 }
@@ -717,6 +806,290 @@ size_t GpuIndexIVFFlat::fetchMissingListsForSearch_(
     return toFetch.size();
 }
 
+void GpuIndexIVFFlat::search_preassigned(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        const idx_t* assign,
+        const float* centroid_dis,
+        float* distances,
+        idx_t* labels,
+        bool store_pairs,
+        const SearchParametersIVF* params,
+        IndexIVFStats* stats) const {
+    // Keep behavior consistent with the base class for untrained/empty cases.
+    // The base implementation will validate k, training, etc.
+    if (n == 0 || k == 0) {
+        return;
+    }
+
+    // Record activations only for lists that this shard can actually serve
+    // (GPU-resident or present in the CPU cache). This avoids double-counting
+    // in multi-shard IndexShardsIVF where all shards receive the full assign
+    // array but only own a subset of IVF lists.
+    if (assign && nlist > 0 && listActivationStats_) {
+        idx_t use_nprobe = params ? params->nprobe : this->nprobe;
+        if (use_nprobe > 0) {
+            auto* mutableThis = const_cast<GpuIndexIVFFlat*>(this);
+            size_t total = (size_t)n * (size_t)use_nprobe;
+            for (size_t i = 0; i < total; ++i) {
+                idx_t lid = assign[i];
+                if (lid < 0 || lid >= nlist) {
+                    continue;
+                }
+                bool onGpu = index_ && index_->isListOnGpu(lid);
+                bool inCpuCache = cpuListCache_.count(lid) > 0;
+                if (onGpu || inCpuCache) {
+                    mutableThis->recordListProbe_(lid);
+                }
+            }
+        }
+    }
+
+    // Fast path: no special miss policy or no CPU-side cache.
+    if (missPolicy_ == IvfListMissPolicy::Error || cpuListCache_.empty()) {
+        GpuIndexIVF::search_preassigned(
+                n,
+                x,
+                k,
+                assign,
+                centroid_dis,
+                distances,
+                labels,
+                store_pairs,
+                params,
+                stats);
+        return;
+    }
+
+    // AutoFetch: load missing lists referenced by assign, then delegate.
+    if (missPolicy_ == IvfListMissPolicy::AutoFetch) {
+        idx_t use_nprobe = params ? params->nprobe : this->nprobe;
+        if (use_nprobe <= 0) {
+            GpuIndexIVF::search_preassigned(
+                    n,
+                    x,
+                    k,
+                    assign,
+                    centroid_dis,
+                    distances,
+                    labels,
+                    store_pairs,
+                    params,
+                    stats);
+            return;
+        }
+
+        std::unordered_set<idx_t> uniqueListIds;
+        uniqueListIds.reserve((size_t)use_nprobe);
+        size_t total = (size_t)n * (size_t)use_nprobe;
+        for (size_t i = 0; i < total; ++i) {
+            idx_t lid = assign[i];
+            if (lid >= 0 && lid < nlist) {
+                uniqueListIds.insert(lid);
+            }
+        }
+
+        if (!uniqueListIds.empty()) {
+            std::vector<idx_t> listIdsToCheck(
+                    uniqueListIds.begin(), uniqueListIds.end());
+            const_cast<GpuIndexIVFFlat*>(this)->fetchMissingListsForSearch_(
+                    listIdsToCheck);
+        }
+
+        GpuIndexIVF::search_preassigned(
+                n,
+                x,
+                k,
+                assign,
+                centroid_dis,
+                distances,
+                labels,
+                store_pairs,
+                params,
+                stats);
+        return;
+    }
+
+    // CpuOffload: split probes into GPU-handled and CPU-handled, search both,
+    // and merge results per query on the CPU.
+    if (missPolicy_ == IvfListMissPolicy::CpuOffload) {
+        if (cpuListCache_.empty()) {
+            GpuIndexIVF::search_preassigned(
+                    n,
+                    x,
+                    k,
+                    assign,
+                    centroid_dis,
+                    distances,
+                    labels,
+                    store_pairs,
+                    params,
+                    stats);
+            return;
+        }
+
+        FAISS_THROW_IF_NOT_MSG(
+                externalIndex_,
+                "GpuIndexIVFFlat::search_preassigned: CpuOffload policy requires "
+                "an external CPU IndexIVFFlat backing index (configure via "
+                "copyFromSelective or equivalent)");
+
+        idx_t use_nprobe = params ? params->nprobe : this->nprobe;
+        FAISS_THROW_IF_NOT(use_nprobe > 0);
+
+        size_t totalProbes = (size_t)n * (size_t)use_nprobe;
+        std::vector<idx_t> assignGpu(totalProbes, (idx_t)-1);
+        std::vector<idx_t> assignCpu(totalProbes, (idx_t)-1);
+
+        bool hasGpuLists = false;
+        bool hasCpuLists = false;
+
+        for (size_t pos = 0; pos < totalProbes; ++pos) {
+            idx_t key = assign[pos];
+            if (key < 0) {
+                continue;
+            }
+            FAISS_THROW_IF_NOT_FMT(
+                    key < nlist,
+                    "GpuIndexIVFFlat::search_preassigned: invalid IVF list id %ld "
+                    "(nlist %ld)",
+                    key,
+                    nlist);
+
+            bool onGpu = index_ && index_->isListOnGpu(key);
+            bool inCpuCache = cpuListCache_.count(key) > 0;
+
+            if (onGpu) {
+                assignGpu[pos] = key;
+                hasGpuLists = true;
+            } else if (inCpuCache) {
+                assignCpu[pos] = key;
+                hasCpuLists = true;
+            } else {
+                // In sharded IndexShardsIVF contexts, each shard sees the full
+                // assign array but owns only a subset of lists. If the external
+                // CPU backing has no data for this list, we can safely ignore it.
+                bool hasBackingData = false;
+                if (externalIndex_ && externalIndex_->invlists) {
+                    hasBackingData =
+                            externalIndex_->invlists->list_size(key) > 0;
+                }
+                if (!hasBackingData) {
+                    continue;
+                }
+
+                FAISS_THROW_IF_NOT_MSG(
+                        false,
+                        "GpuIndexIVFFlat::search_preassigned: CpuOffload policy "
+                        "requires probed lists to be either resident on GPU or "
+                        "present in CPU cache / external backing");
+            }
+        }
+
+        // GPU partial results
+        std::vector<float> D_gpu;
+        std::vector<idx_t> I_gpu;
+        if (hasGpuLists) {
+            D_gpu.resize((size_t)n * (size_t)k);
+            I_gpu.resize((size_t)n * (size_t)k);
+            GpuIndexIVF::search_preassigned(
+                    n,
+                    x,
+                    k,
+                    assignGpu.data(),
+                    centroid_dis,
+                    D_gpu.data(),
+                    I_gpu.data(),
+                    /*store_pairs=*/false,
+                    params,
+                    /*stats=*/nullptr);
+        }
+
+        // CPU partial results
+        std::vector<float> D_cpu;
+        std::vector<idx_t> I_cpu;
+        if (hasCpuLists) {
+            D_cpu.resize((size_t)n * (size_t)k);
+            I_cpu.resize((size_t)n * (size_t)k);
+            externalIndex_->search_preassigned(
+                    n,
+                    x,
+                    k,
+                    assignCpu.data(),
+                    centroid_dis,
+                    D_cpu.data(),
+                    I_cpu.data(),
+                    /*store_pairs=*/false,
+                    params,
+                    /*stats=*/nullptr);
+        }
+
+        if (hasGpuLists && hasCpuLists) {
+            std::vector<float> allDistances(2 * (size_t)n * (size_t)k);
+            std::vector<idx_t> allLabels(2 * (size_t)n * (size_t)k);
+            size_t blockSize = (size_t)n * (size_t)k;
+            std::copy(D_gpu.begin(), D_gpu.end(), allDistances.begin());
+            std::copy(
+                    D_cpu.begin(),
+                    D_cpu.end(),
+                    allDistances.begin() + blockSize);
+            std::copy(I_gpu.begin(), I_gpu.end(), allLabels.begin());
+            std::copy(
+                    I_cpu.begin(),
+                    I_cpu.end(),
+                    allLabels.begin() + blockSize);
+
+            if (metric_type == METRIC_L2) {
+                merge_knn_results<idx_t, CMin<float, int>>(
+                        (size_t)n,
+                        (size_t)k,
+                        2,
+                        allDistances.data(),
+                        allLabels.data(),
+                        distances,
+                        labels);
+            } else {
+                merge_knn_results<idx_t, CMax<float, int>>(
+                        (size_t)n,
+                        (size_t)k,
+                        2,
+                        allDistances.data(),
+                        allLabels.data(),
+                        distances,
+                        labels);
+            }
+        } else if (hasGpuLists) {
+            std::copy(D_gpu.begin(), D_gpu.end(), distances);
+            std::copy(I_gpu.begin(), I_gpu.end(), labels);
+        } else if (hasCpuLists) {
+            std::copy(D_cpu.begin(), D_cpu.end(), distances);
+            std::copy(I_cpu.begin(), I_cpu.end(), labels);
+        } else {
+            float neutral = (metric_type == METRIC_L2)
+                    ? std::numeric_limits<float>::infinity()
+                    : -std::numeric_limits<float>::infinity();
+            std::fill(distances, distances + (size_t)n * (size_t)k, neutral);
+            std::fill(labels, labels + (size_t)n * (size_t)k, idx_t(-1));
+        }
+
+        return;
+    }
+
+    // Unknown policy: delegate to base for safety.
+    GpuIndexIVF::search_preassigned(
+            n,
+            x,
+            k,
+            assign,
+            centroid_dis,
+            distances,
+            labels,
+            store_pairs,
+            params,
+            stats);
+}
+
 void GpuIndexIVFFlat::searchImpl_(
         idx_t n,
         const float* x,
@@ -726,6 +1099,34 @@ void GpuIndexIVFFlat::searchImpl_(
         const SearchParameters* params) const {
     // Device should already be set by GpuIndex::search
     DeviceScope scope(config_.device);
+
+    // Record IVF list activations based on coarse quantizer assignments.
+    if (n > 0 && nlist > 0 && quantizer && listActivationStats_) {
+        int use_nprobe = getCurrentNProbe_(params);
+        if (use_nprobe > 0) {
+            std::vector<idx_t> coarseIndices(
+                    static_cast<size_t>(n) * static_cast<size_t>(use_nprobe));
+            std::vector<float> coarseDistances(
+                    static_cast<size_t>(n) * static_cast<size_t>(use_nprobe));
+
+            quantizer->search(
+                    n,
+                    x,
+                    use_nprobe,
+                    coarseDistances.data(),
+                    coarseIndices.data());
+
+            auto* indicesData = coarseIndices.data();
+            size_t total = coarseIndices.size();
+            auto* mutableThis = const_cast<GpuIndexIVFFlat*>(this);
+            for (size_t i = 0; i < total; ++i) {
+                idx_t listId = indicesData[i];
+                if (listId >= 0) {
+                    mutableThis->recordListProbe_(listId);
+                }
+            }
+        }
+    }
 
     // Fast path: if no special miss policy or no CPU-side cached lists,
     // delegate to the base IVF implementation.
@@ -853,6 +1254,19 @@ void GpuIndexIVFFlat::searchImpl_(
                     assignCpu[pos] = key;
                     hasCpuLists = true;
                 } else {
+                    // In sharded IndexShardsIVF contexts, each shard sees the full
+                    // list assignment matrix but owns only a subset of IVF lists.
+                    // If the external CPU backing has no data for this list, we
+                    // can safely ignore it for this shard.
+                    bool hasBackingData = false;
+                    if (externalIndex_ && externalIndex_->invlists) {
+                        hasBackingData =
+                                externalIndex_->invlists->list_size(key) > 0;
+                    }
+                    if (!hasBackingData) {
+                        continue;
+                    }
+
                     FAISS_THROW_IF_NOT_MSG(
                             false,
                             "GpuIndexIVFFlat::searchImpl_: CpuOffload policy "
