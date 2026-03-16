@@ -224,38 +224,21 @@ class GpuPoolController:
         Raises:
             TimeoutError: If the command is not processed within the timeout.
         """
-        # #region agent log - _wait_for_response
-        import json, os
-        _log_path = "/home/wangzehao/projects/faiss/.cursor/debug-3a22cd.log"
-        def _log(h, m, d=None):
-            try:
-                with open(_log_path, "a") as f:
-                    f.write(json.dumps({"sessionId":"3a22cd","runId":"debug","hypothesisId":h,"location":"gpu_pool_controller.py:_wait_for_response","message":m,"data":d or {},"timestamp":int(time.time()*1000)}) + "\n")
-            except: pass
-        _log("D", "_wait_for_response start", {"timeout_ms": timeout_ms, "device_id": getattr(self, 'device_id', 'unknown')})
-        # #endregion
         start = time.time()
-        poll_count = 0
         while (time.time() - start) * 1000 < timeout_ms:
             data = self._read_control_block()
-            poll_count += 1
-            cmd_val = data[self._IDX_COMMAND]
             # Command cleared means it has been processed
-            if cmd_val == ResizeCommand.NOP:
+            if data[self._IDX_COMMAND] == ResizeCommand.NOP:
                 error_bytes = data[self._IDX_ERROR_MSG]
                 error_str = error_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
-                _log("D", "Command processed", {"poll_count": poll_count, "status": data[self._IDX_STATUS], "actual_size": data[self._IDX_ACTUAL_SIZE]})
                 return {
                     "status": ResizeStatus(data[self._IDX_STATUS]),
                     "actual_size": data[self._IDX_ACTUAL_SIZE],
                     "available": data[self._IDX_AVAILABLE],
                     "error": error_str,
                 }
-            if poll_count == 1 or poll_count % 100 == 0:
-                _log("D", f"Still waiting...", {"poll_count": poll_count, "command": cmd_val, "status": data[self._IDX_STATUS]})
             time.sleep(0.001)  # 1ms poll interval
 
-        _log("D", "Timeout reached", {"poll_count": poll_count, "elapsed_ms": (time.time() - start) * 1000})
         raise TimeoutError(
             f"Resize command timed out after {timeout_ms}ms. "
             f"The pool may be unresponsive or IPC polling is disabled."

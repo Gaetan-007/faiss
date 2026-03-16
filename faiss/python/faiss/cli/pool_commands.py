@@ -42,38 +42,20 @@ def get_pool_controller_safe(device_id: int):
     Raises:
         PoolNotFoundError: If pool doesn't exist or IPC not available
     """
-    # #region agent log - get_pool_controller_safe
-    import json, time as _time, os
-    _log_path = "/home/wangzehao/projects/faiss/.cursor/debug-3a22cd.log"
-    def _log(h, m, d=None):
-        try:
-            with open(_log_path, "a") as f:
-                f.write(json.dumps({"sessionId":"3a22cd","runId":"debug","hypothesisId":h,"location":"pool_commands.py:get_pool_controller_safe","message":m,"data":d or {},"timestamp":int(_time.time()*1000)}) + "\n")
-        except: pass
-    _log("C", "get_pool_controller_safe entry", {"device_id": device_id})
-    # Check for shared memory file
-    shm_path = f"/dev/shm/faiss_gpu_pool_ctrl_{device_id}"
-    shm_exists = os.path.exists(shm_path)
-    _log("C", "Checking shared memory", {"shm_path": shm_path, "exists": shm_exists})
-    # #endregion
     try:
         # Import here to avoid heavy import at module load time
         from faiss.gpu_pool_controller import get_pool_controller
         
         ctrl = get_pool_controller(device_id)
         if ctrl is None:
-            _log("C", "get_pool_controller returned None", {})
             raise PoolNotFoundError(
                 f"GPU {device_id} pool not found. "
                 f"Make sure the pool is initialized with IPC enabled."
             )
-        _log("C", "Got pool controller", {"device_id": device_id})
         return ctrl
     except ImportError as e:
-        _log("C", "ImportError", {"error": str(e)})
         raise PoolNotFoundError(f"Failed to import GpuPoolController: {e}")
     except Exception as e:
-        _log("C", "Exception", {"error": str(e)})
         raise PoolNotFoundError(f"Failed to connect to GPU {device_id} pool: {e}")
 
 

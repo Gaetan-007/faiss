@@ -105,7 +105,8 @@ class STEncoder:
         self.use_fp16 = use_fp16
 
         self.model = SentenceTransformer(
-            model_path, model_kwargs={"torch_dtype": torch.float16 if use_fp16 else torch.float}
+            model_path,
+            model_kwargs={"torch_dtype": torch.float16 if use_fp16 else torch.float32},
         )
 
     @torch.inference_mode(mode=True)
